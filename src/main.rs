@@ -1368,6 +1368,9 @@ struct App {
     // Mouse hit-testing rects, populated each frame inside `ui()`.
     tabs_rect: Rect,
     list_rect: Rect,
+    /// Each entry is the screen rect of a join-address chip and the literal
+    /// `ip:port` to copy on click.
+    join_chips: Vec<(Rect, String)>,
 
     lang: Lang,
 }
@@ -1413,6 +1416,7 @@ impl App {
             prompt: None,
             tabs_rect: Rect::default(),
             list_rect: Rect::default(),
+            join_chips: Vec::new(),
             lang,
         };
         app.refresh_all();
@@ -2249,29 +2253,31 @@ fn ui(f: &mut Frame, app: &mut App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3),
-            Constraint::Length(3),
-            Constraint::Min(3),
-            Constraint::Length(3),
+            Constraint::Length(3), // status bar
+            Constraint::Length(3), // join bar (always-visible primary connect chip)
+            Constraint::Length(3), // tabs
+            Constraint::Min(3),    // content
+            Constraint::Length(3), // hints / status line
         ])
         .split(f.area());
 
     draw_status_bar(f, chunks[0], app);
-    draw_tabs(f, chunks[1], app);
-    app.tabs_rect = chunks[1];
-    app.list_rect = chunks[2];
+    draw_join_bar(f, chunks[1], app);
+    draw_tabs(f, chunks[2], app);
+    app.tabs_rect = chunks[2];
+    app.list_rect = chunks[3];
     match app.tab {
-        TabId::Worlds => draw_worlds(f, chunks[2], app),
-        TabId::Whitelist => draw_whitelist(f, chunks[2], app),
-        TabId::Ops => draw_ops(f, chunks[2], app),
-        TabId::Config => draw_config(f, chunks[2], app),
-        TabId::Logs => draw_logs(f, chunks[2], app),
-        TabId::Yaml => draw_yaml(f, chunks[2], app),
-        TabId::Backups => draw_backups(f, chunks[2], app),
-        TabId::Rcon => draw_rcon(f, chunks[2], app),
-        TabId::Server => draw_server(f, chunks[2], app),
+        TabId::Worlds => draw_worlds(f, chunks[3], app),
+        TabId::Whitelist => draw_whitelist(f, chunks[3], app),
+        TabId::Ops => draw_ops(f, chunks[3], app),
+        TabId::Config => draw_config(f, chunks[3], app),
+        TabId::Logs => draw_logs(f, chunks[3], app),
+        TabId::Yaml => draw_yaml(f, chunks[3], app),
+        TabId::Backups => draw_backups(f, chunks[3], app),
+        TabId::Rcon => draw_rcon(f, chunks[3], app),
+        TabId::Server => draw_server(f, chunks[3], app),
     }
-    draw_hints(f, chunks[3], app);
+    draw_hints(f, chunks[4], app);
 
     if let Some(prompt) = app.prompt.clone() {
         draw_prompt(f, &prompt, app.lang);
@@ -2295,6 +2301,102 @@ fn draw_status_bar(f: &mut Frame, area: Rect, app: &App) {
         Span::raw(app.server_dir.display().to_string()),
     ]);
     let p = Paragraph::new(line).block(Block::default().borders(Borders::ALL).title(" mc-tui "));
+    f.render_widget(p, area);
+}
+
+/// Always-visible primary connect address (typically the ZeroTier one).
+/// Click the chip to copy `<ip>:<port>` to the clipboard via wl-copy.
+fn draw_join_bar(f: &mut Frame, area: Rect, app: &mut App) {
+    let nics = detect_interfaces();
+    let port: u16 = get_property(&app.properties, "server-port")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(25565);
+
+    // Pick the most "tell-friends-this-one" interface. nic_kind_priority orders
+    // ZeroTier first, then LAN, then Public, etc. Skip Loopback / Docker / TUN.
+    let primary = nics.iter().find(|n| {
+        !matches!(
+            n.kind,
+            NicKind::Loopback | NicKind::Docker | NicKind::Tun
+        )
+    });
+
+    app.join_chips.clear();
+
+    let inner_x = area.x.saturating_add(1);
+    let inner_y = area.y.saturating_add(1);
+
+    let mut spans: Vec<Span> = Vec::new();
+    spans.push(Span::raw(" "));
+
+    let label_lang = app.lang;
+    let title = match app.lang {
+        Lang::En => " Join — click to copy ",
+        Lang::Zh => " 连接地址（点击复制）",
+    };
+
+    if let Some(n) = primary {
+        let chip_text = format!("{}:{}", n.ip, port);
+        let kind_label = nic_kind_label(label_lang, n.kind);
+
+        // Layout: " [<kind>] <ip>:<port> "
+        spans.push(Span::styled(
+            format!("[{}]", kind_label),
+            Style::default().fg(nic_kind_color(n.kind)).add_modifier(Modifier::BOLD),
+        ));
+        spans.push(Span::raw(" "));
+
+        // Track chip rect (x..x+chip_text.len(), y=inner_y) for mouse hit-testing.
+        let mut chip_x = inner_x + 1; // " "
+        chip_x += format!("[{}]", kind_label).chars().count() as u16;
+        chip_x += 1; // " "
+        let chip_w = chip_text.chars().count() as u16;
+        let chip_rect = Rect {
+            x: chip_x,
+            y: inner_y,
+            width: chip_w,
+            height: 1,
+        };
+        app.join_chips.push((chip_rect, chip_text.clone()));
+
+        spans.push(Span::styled(
+            chip_text,
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+        ));
+
+        // Hint about other addresses in Server tab.
+        spans.push(Span::raw("    "));
+        let extra = nics
+            .iter()
+            .filter(|m| {
+                !matches!(
+                    m.kind,
+                    NicKind::Loopback | NicKind::Docker | NicKind::Tun
+                )
+            })
+            .count()
+            .saturating_sub(1);
+        if extra > 0 {
+            let more = match app.lang {
+                Lang::En => format!("(+{} more on Server tab)", extra),
+                Lang::Zh => format!("(+{} 个在 9 运维)", extra),
+            };
+            spans.push(Span::styled(more, Style::default().fg(Color::DarkGray)));
+        }
+    } else {
+        spans.push(Span::styled(
+            match app.lang {
+                Lang::En => "(no LAN/Public/ZeroTier IPv4 detected)",
+                Lang::Zh => "(没检测到 LAN/Public/ZeroTier IPv4)",
+            },
+            Style::default().fg(Color::DarkGray),
+        ));
+    }
+
+    let p = Paragraph::new(Line::from(spans))
+        .block(Block::default().borders(Borders::ALL).title(title));
     f.render_widget(p, area);
 }
 
@@ -3256,6 +3358,28 @@ fn handle_mouse(app: &mut App, me: MouseEvent) {
         return;
     }
     let (col, row) = (me.column, me.row);
+
+    // Join-bar chip click → copy to clipboard.
+    let chips = app.join_chips.clone();
+    for (r, payload) in chips {
+        if rect_contains(r, col, row) {
+            let copied = std::process::Command::new("wl-copy")
+                .arg(&payload)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            app.status = match (app.lang, copied) {
+                (Lang::En, true) => format!("✓ Copied {} to clipboard", payload),
+                (Lang::En, false) => format!("ℹ {} (wl-copy unavailable)", payload),
+                (Lang::Zh, true) => format!("✓ 已复制 {} 到剪贴板", payload),
+                (Lang::Zh, false) => format!("ℹ {}（wl-copy 不可用）", payload),
+            };
+            return;
+        }
+    }
 
     if rect_contains(app.tabs_rect, col, row) {
         // ratatui Tabs widget renders titles as " 1 Worlds " " │ " " 2 Whitelist " ...
