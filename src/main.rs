@@ -2127,6 +2127,400 @@ fn first_boot_run(dir: &Path, jar: &str, heap_mb: u32) -> Result<()> {
     Ok(())
 }
 
+// ---------- v0.5: backup scanner ----------
+//
+// Look for archive files in standard backup locations and present them as a
+// time-sorted list. Backup *creation* belongs to v0.6 (scheduled/ad-hoc); this
+// is just the read side: discover, sort, present.
+
+#[derive(Debug, Clone)]
+struct BackupEntry {
+    name: String,
+    path: PathBuf,
+    size_bytes: u64,
+    modified: Option<chrono::DateTime<chrono::Local>>,
+}
+
+fn is_backup_file(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    lower.ends_with(".tar.gz")
+        || lower.ends_with(".tgz")
+        || lower.ends_with(".tar.zst")
+        || lower.ends_with(".tar.xz")
+        || lower.ends_with(".tar.bz2")
+        || lower.ends_with(".zip")
+        || lower.ends_with(".7z")
+}
+
+fn backup_dir_candidates(server_dir: &Path) -> Vec<PathBuf> {
+    let mut out = vec![server_dir.join("backups")];
+    if let Some(parent) = server_dir.parent() {
+        out.push(parent.join("backups"));
+        out.push(parent.join("mc-backups"));
+        if let Some(name) = server_dir.file_name() {
+            out.push(parent.join(format!("{}-backups", name.to_string_lossy())));
+        }
+    }
+    out
+}
+
+fn scan_backups(server_dir: &Path) -> Vec<BackupEntry> {
+    let mut out = Vec::new();
+    let mut seen: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+    for dir in backup_dir_candidates(server_dir) {
+        let canonical = match dir.canonicalize() {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        if !seen.insert(canonical.clone()) {
+            continue;
+        }
+        let Ok(rd) = fs::read_dir(&canonical) else { continue };
+        for entry in rd.filter_map(|e| e.ok()) {
+            let p = entry.path();
+            if !p.is_file() {
+                continue;
+            }
+            let name = match p.file_name().and_then(|n| n.to_str()) {
+                Some(s) => s.to_string(),
+                None => continue,
+            };
+            if !is_backup_file(&name) {
+                continue;
+            }
+            let meta = entry.metadata().ok();
+            out.push(BackupEntry {
+                name,
+                path: p.clone(),
+                size_bytes: meta.as_ref().map(|m| m.len()).unwrap_or(0),
+                modified: meta
+                    .and_then(|m| m.modified().ok())
+                    .map(chrono::DateTime::<chrono::Local>::from),
+            });
+        }
+    }
+    out.sort_by(|a, b| b.modified.cmp(&a.modified));
+    out
+}
+
+// ---------- v0.5: YAML flattener (paper-global.yml etc.) ----------
+//
+// Big YAMLs (`paper-global.yml`, `purpur.yml`, …) become a flat list of rows
+// where each row knows its tree depth, displayed label, and a canonical path
+// back into the `serde_yaml::Value`. Rendering = list. Editing a leaf =
+// prompt → `parse_yaml_scalar` → `yaml_set(..., path, new_value)` → write.
+
+#[derive(Debug, Clone)]
+enum YamlSeg {
+    Key(String),
+    Index(usize),
+}
+
+#[derive(Debug, Clone)]
+enum YamlDisplay {
+    Branch, // mapping or sequence
+    Scalar(String),
+}
+
+#[derive(Debug, Clone)]
+struct YamlRow {
+    indent: u8,
+    path: Vec<YamlSeg>,
+    label: String,
+    value: YamlDisplay,
+}
+
+fn flatten_yaml(v: &serde_yaml::Value) -> Vec<YamlRow> {
+    let mut out = Vec::new();
+    let mut path = Vec::new();
+    walk_yaml(v, 0, &mut path, &mut out);
+    out
+}
+
+fn walk_yaml(
+    v: &serde_yaml::Value,
+    indent: u8,
+    path: &mut Vec<YamlSeg>,
+    out: &mut Vec<YamlRow>,
+) {
+    match v {
+        serde_yaml::Value::Mapping(m) => {
+            for (k, val) in m {
+                let key_str = match k {
+                    serde_yaml::Value::String(s) => s.clone(),
+                    other => serde_yaml::to_string(other).unwrap_or_default().trim().to_string(),
+                };
+                path.push(YamlSeg::Key(key_str.clone()));
+                if val.is_mapping() || val.is_sequence() {
+                    out.push(YamlRow {
+                        indent,
+                        path: path.clone(),
+                        label: key_str,
+                        value: YamlDisplay::Branch,
+                    });
+                    walk_yaml(val, indent.saturating_add(1), path, out);
+                } else {
+                    out.push(YamlRow {
+                        indent,
+                        path: path.clone(),
+                        label: key_str,
+                        value: YamlDisplay::Scalar(yaml_scalar_string(val)),
+                    });
+                }
+                path.pop();
+            }
+        }
+        serde_yaml::Value::Sequence(s) => {
+            for (i, val) in s.iter().enumerate() {
+                path.push(YamlSeg::Index(i));
+                let label = format!("[{}]", i);
+                if val.is_mapping() || val.is_sequence() {
+                    out.push(YamlRow {
+                        indent,
+                        path: path.clone(),
+                        label,
+                        value: YamlDisplay::Branch,
+                    });
+                    walk_yaml(val, indent.saturating_add(1), path, out);
+                } else {
+                    out.push(YamlRow {
+                        indent,
+                        path: path.clone(),
+                        label,
+                        value: YamlDisplay::Scalar(yaml_scalar_string(val)),
+                    });
+                }
+                path.pop();
+            }
+        }
+        _ => {}
+    }
+}
+
+fn yaml_scalar_string(v: &serde_yaml::Value) -> String {
+    match v {
+        serde_yaml::Value::String(s) => s.clone(),
+        serde_yaml::Value::Bool(b) => b.to_string(),
+        serde_yaml::Value::Number(n) => n.to_string(),
+        serde_yaml::Value::Null => "null".to_string(),
+        _ => serde_yaml::to_string(v).unwrap_or_default().trim().to_string(),
+    }
+}
+
+fn yaml_set(
+    root: &mut serde_yaml::Value,
+    path: &[YamlSeg],
+    new_value: serde_yaml::Value,
+) -> Result<()> {
+    if path.is_empty() {
+        *root = new_value;
+        return Ok(());
+    }
+    let mut cur = root;
+    for seg in &path[..path.len() - 1] {
+        cur = match seg {
+            YamlSeg::Key(k) => cur
+                .get_mut(serde_yaml::Value::String(k.clone()))
+                .with_context(|| format!("yaml path missing key: {}", k))?,
+            YamlSeg::Index(i) => cur
+                .get_mut(*i)
+                .with_context(|| format!("yaml index out of range: {}", i))?,
+        };
+    }
+    match path.last().unwrap() {
+        YamlSeg::Key(k) => {
+            if let serde_yaml::Value::Mapping(m) = cur {
+                m.insert(serde_yaml::Value::String(k.clone()), new_value);
+            } else {
+                anyhow::bail!("expected mapping at parent of key {}", k);
+            }
+        }
+        YamlSeg::Index(i) => {
+            if let serde_yaml::Value::Sequence(s) = cur {
+                if *i >= s.len() {
+                    anyhow::bail!("index out of range: {}", i);
+                }
+                s[*i] = new_value;
+            } else {
+                anyhow::bail!("expected sequence at parent of [{}]", i);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn parse_yaml_scalar(input: &str) -> serde_yaml::Value {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return serde_yaml::Value::String(String::new());
+    }
+    if trimmed.eq_ignore_ascii_case("true") {
+        return serde_yaml::Value::Bool(true);
+    }
+    if trimmed.eq_ignore_ascii_case("false") {
+        return serde_yaml::Value::Bool(false);
+    }
+    if trimmed.eq_ignore_ascii_case("null") || trimmed == "~" {
+        return serde_yaml::Value::Null;
+    }
+    if let Ok(i) = trimmed.parse::<i64>() {
+        return serde_yaml::Value::Number(i.into());
+    }
+    if let Ok(f) = trimmed.parse::<f64>() {
+        // Fallback to f64 only if it isn't a clean integer (handled above).
+        return serde_yaml::Value::Number(serde_yaml::Number::from(f));
+    }
+    serde_yaml::Value::String(trimmed.to_string())
+}
+
+/// Server-relative paths to YAMLs we care about. Some live at the root, some
+/// under `config/` (Paper puts `paper-global.yml` and `paper-world-defaults.yml` there).
+fn list_yaml_files(server_dir: &Path) -> Vec<PathBuf> {
+    let known = [
+        "paper-global.yml",
+        "paper-world-defaults.yml",
+        "purpur.yml",
+        "spigot.yml",
+        "bukkit.yml",
+        "commands.yml",
+        "permissions.yml",
+        "help.yml",
+    ];
+    let mut out = Vec::new();
+    for n in known {
+        let p = server_dir.join(n);
+        if p.is_file() {
+            out.push(p);
+            continue;
+        }
+        let pc = server_dir.join("config").join(n);
+        if pc.is_file() {
+            out.push(pc);
+        }
+    }
+    out
+}
+
+// ---------- v0.5: RCON client ----------
+//
+// Source-of-truth: https://wiki.vg/RCON
+// Packet: i32_le length | i32_le request_id | i32_le type | body (utf8) | 0x00 | 0x00
+// Types we use: 3 = LOGIN, 2 = COMMAND / AUTH_RESPONSE, 0 = COMMAND_RESPONSE.
+// Auth failure echoes request_id = -1.
+
+const RCON_TYPE_LOGIN: i32 = 3;
+const RCON_TYPE_COMMAND: i32 = 2;
+#[allow(dead_code)]
+const RCON_TYPE_RESPONSE: i32 = 0;
+
+struct RconClient {
+    stream: std::net::TcpStream,
+    next_id: i32,
+}
+
+impl RconClient {
+    fn connect(host: &str, port: u16, password: &str) -> Result<Self> {
+        use std::net::ToSocketAddrs;
+        use std::time::Duration;
+        let addr = (host, port)
+            .to_socket_addrs()
+            .with_context(|| format!("resolve {}:{}", host, port))?
+            .next()
+            .with_context(|| format!("no addrs for {}:{}", host, port))?;
+        let stream = std::net::TcpStream::connect_timeout(&addr, Duration::from_secs(5))
+            .with_context(|| format!("connect {}:{}", host, port))?;
+        stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+        stream.set_write_timeout(Some(Duration::from_secs(5)))?;
+        let mut c = RconClient { stream, next_id: 1 };
+        c.auth(password)?;
+        Ok(c)
+    }
+
+    fn auth(&mut self, password: &str) -> Result<()> {
+        let id = self.next_id;
+        self.next_id += 1;
+        self.send_packet(id, RCON_TYPE_LOGIN, password.as_bytes())?;
+        // Some servers send an empty COMMAND_RESPONSE first; loop until we see AUTH_RESPONSE.
+        for _ in 0..3 {
+            let (rid, ty, _body) = self.recv_packet()?;
+            if ty == RCON_TYPE_COMMAND {
+                if rid == -1 {
+                    anyhow::bail!("RCON auth failed (wrong password?)");
+                }
+                if rid == id {
+                    return Ok(());
+                }
+            }
+            // ignore stray RESPONSE_VALUE packets
+        }
+        anyhow::bail!("RCON: never got auth response");
+    }
+
+    fn exec(&mut self, cmd: &str) -> Result<String> {
+        let id = self.next_id;
+        self.next_id += 1;
+        self.send_packet(id, RCON_TYPE_COMMAND, cmd.as_bytes())?;
+        let (_rid, _ty, body) = self.recv_packet()?;
+        Ok(body)
+    }
+
+    fn send_packet(&mut self, id: i32, ty: i32, body: &[u8]) -> Result<()> {
+        use std::io::Write;
+        let len: i32 = (10 + body.len()) as i32; // id(4) + ty(4) + body + 0x00 + 0x00
+        let mut packet = Vec::with_capacity(4 + len as usize);
+        packet.extend_from_slice(&len.to_le_bytes());
+        packet.extend_from_slice(&id.to_le_bytes());
+        packet.extend_from_slice(&ty.to_le_bytes());
+        packet.extend_from_slice(body);
+        packet.push(0);
+        packet.push(0);
+        self.stream.write_all(&packet)?;
+        self.stream.flush()?;
+        Ok(())
+    }
+
+    fn recv_packet(&mut self) -> Result<(i32, i32, String)> {
+        use std::io::Read;
+        let mut len_buf = [0u8; 4];
+        self.stream.read_exact(&mut len_buf)?;
+        let len = i32::from_le_bytes(len_buf);
+        if !(10..=4096).contains(&len) {
+            anyhow::bail!("invalid rcon packet length: {}", len);
+        }
+        let mut payload = vec![0u8; len as usize];
+        self.stream.read_exact(&mut payload)?;
+        let id = i32::from_le_bytes(payload[0..4].try_into().unwrap());
+        let ty = i32::from_le_bytes(payload[4..8].try_into().unwrap());
+        // body ends at the first NUL after offset 8.
+        let body_bytes = &payload[8..];
+        let body_end = body_bytes.iter().position(|b| *b == 0).unwrap_or(body_bytes.len());
+        let body = String::from_utf8_lossy(&body_bytes[..body_end]).to_string();
+        Ok((id, ty, body))
+    }
+}
+
+/// Read RCON connect info from `server.properties`. Returns (host, port, password).
+/// Host falls back to `127.0.0.1` if `server-ip` is empty (Paper default).
+fn rcon_settings(props: &[(String, String)]) -> Option<(String, u16, String)> {
+    let enabled = get_property(props, "enable-rcon").map(|v| v == "true").unwrap_or(false);
+    if !enabled {
+        return None;
+    }
+    let port: u16 = get_property(props, "rcon.port")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(25575);
+    let password = get_property(props, "rcon.password")
+        .map(|s| s.to_string())
+        .unwrap_or_default();
+    let host_raw = get_property(props, "server-ip").unwrap_or("");
+    let host = if host_raw.is_empty() || host_raw == "0.0.0.0" {
+        "127.0.0.1".to_string()
+    } else {
+        host_raw.to_string()
+    };
+    Some((host, port, password))
+}
+
 fn render_screenshot(
     server_dir: &Path,
     tab: &str,
@@ -2413,6 +2807,143 @@ Java(TM) SE Runtime Environment ..."#;
         let h = recommended_heap_mb();
         assert!(h >= 2048, "heap should be at least 2GB, got {}M", h);
         assert!(h <= 8192, "heap should be capped at 8GB, got {}M", h);
+    }
+
+    #[test]
+    fn is_backup_file_recognises_common_archives() {
+        for n in [
+            "world-2024-01-01.tar.gz",
+            "snap.tgz",
+            "snap.tar.zst",
+            "world.zip",
+            "snap.tar.xz",
+            "snap.7z",
+            "snap.TAR.GZ", // case-insensitive
+        ] {
+            assert!(is_backup_file(n), "expected {} to be recognised", n);
+        }
+        for n in ["world.dat", "log.txt", "snap.tar"] {
+            assert!(!is_backup_file(n), "expected {} NOT recognised", n);
+        }
+    }
+
+    #[test]
+    fn rcon_settings_disabled_returns_none() {
+        let props = vec![
+            ("enable-rcon".into(), "false".into()),
+            ("rcon.port".into(), "25575".into()),
+            ("rcon.password".into(), "secret".into()),
+        ];
+        assert!(rcon_settings(&props).is_none());
+    }
+
+    #[test]
+    fn rcon_settings_enabled_returns_defaults() {
+        let props = vec![
+            ("enable-rcon".into(), "true".into()),
+            ("rcon.port".into(), "12345".into()),
+            ("rcon.password".into(), "hunter2".into()),
+            ("server-ip".into(), "".into()),
+        ];
+        let (host, port, pw) = rcon_settings(&props).unwrap();
+        assert_eq!(host, "127.0.0.1");
+        assert_eq!(port, 12345);
+        assert_eq!(pw, "hunter2");
+    }
+
+    #[test]
+    fn rcon_packet_roundtrip_in_memory() {
+        // Verify our packet framing: build a packet, re-parse the header fields.
+        let body = b"list";
+        let id: i32 = 7;
+        let ty: i32 = RCON_TYPE_COMMAND;
+        let len: i32 = (10 + body.len()) as i32;
+        let mut packet = Vec::new();
+        packet.extend_from_slice(&len.to_le_bytes());
+        packet.extend_from_slice(&id.to_le_bytes());
+        packet.extend_from_slice(&ty.to_le_bytes());
+        packet.extend_from_slice(body);
+        packet.push(0);
+        packet.push(0);
+        assert_eq!(packet.len(), 4 + len as usize);
+        let parsed_len = i32::from_le_bytes(packet[0..4].try_into().unwrap());
+        let parsed_id = i32::from_le_bytes(packet[4..8].try_into().unwrap());
+        let parsed_ty = i32::from_le_bytes(packet[8..12].try_into().unwrap());
+        assert_eq!(parsed_len, len);
+        assert_eq!(parsed_id, id);
+        assert_eq!(parsed_ty, ty);
+        // Body terminator
+        assert_eq!(packet[packet.len() - 1], 0);
+        assert_eq!(packet[packet.len() - 2], 0);
+    }
+
+    #[test]
+    fn scan_backups_finds_archives_in_local_dir() {
+        let dir = tempdir();
+        let backups = dir.join("backups");
+        fs::create_dir_all(&backups).unwrap();
+        fs::write(backups.join("snap-1.tar.gz"), b"x").unwrap();
+        fs::write(backups.join("snap-2.zip"), b"y").unwrap();
+        fs::write(backups.join("not-a-backup.txt"), b"z").unwrap();
+        // Need a `server.properties` so that the dir looks like a real server-dir
+        fs::write(dir.join("server.properties"), b"").unwrap();
+        let out = scan_backups(&dir);
+        let names: Vec<_> = out.iter().map(|b| b.name.clone()).collect();
+        assert!(names.contains(&"snap-1.tar.gz".to_string()));
+        assert!(names.contains(&"snap-2.zip".to_string()));
+        assert!(!names.contains(&"not-a-backup.txt".to_string()));
+    }
+
+    #[test]
+    fn yaml_flatten_walks_nested_mapping() {
+        let yaml = r#"
+chunks:
+  view-distance: 10
+  simulation-distance: 8
+players:
+  - name: Alice
+    level: 1
+"#;
+        let v: serde_yaml::Value = serde_yaml::from_str(yaml).unwrap();
+        let rows = flatten_yaml(&v);
+        // Expect: chunks (branch), chunks.view-distance (10), chunks.sim-distance (8),
+        // players (branch), players[0] (branch), players[0].name (Alice), players[0].level (1)
+        assert!(rows.len() >= 6, "got {} rows", rows.len());
+        let labels: Vec<_> = rows.iter().map(|r| r.label.clone()).collect();
+        assert!(labels.contains(&"chunks".to_string()));
+        assert!(labels.contains(&"view-distance".to_string()));
+        assert!(labels.contains(&"name".to_string()));
+        assert!(labels.iter().any(|l| l == "[0]"));
+    }
+
+    #[test]
+    fn yaml_set_modifies_leaf() {
+        let yaml = "view-distance: 10\n";
+        let mut v: serde_yaml::Value = serde_yaml::from_str(yaml).unwrap();
+        yaml_set(
+            &mut v,
+            &[YamlSeg::Key("view-distance".into())],
+            parse_yaml_scalar("32"),
+        )
+        .unwrap();
+        let dumped = serde_yaml::to_string(&v).unwrap();
+        assert!(dumped.contains("view-distance: 32"), "got: {}", dumped);
+    }
+
+    #[test]
+    fn parse_yaml_scalar_typing() {
+        assert!(matches!(parse_yaml_scalar("true"), serde_yaml::Value::Bool(true)));
+        assert!(matches!(parse_yaml_scalar("False"), serde_yaml::Value::Bool(false)));
+        assert!(matches!(parse_yaml_scalar("null"), serde_yaml::Value::Null));
+        assert!(matches!(parse_yaml_scalar("~"), serde_yaml::Value::Null));
+        match parse_yaml_scalar("42") {
+            serde_yaml::Value::Number(n) => assert_eq!(n.as_i64(), Some(42)),
+            _ => panic!("expected number"),
+        }
+        match parse_yaml_scalar("hello world") {
+            serde_yaml::Value::String(s) => assert_eq!(s, "hello world"),
+            _ => panic!("expected string"),
+        }
     }
 
     #[test]
