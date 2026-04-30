@@ -1,0 +1,26 @@
+[package]
+name = "mc-tui"
+version = "0.1.0"
+edition = "2024"
+description = "TUI manager for a Minecraft Paper/Purpur server"
+license = "MIT"
+readme = "README.md"
+keywords = ["minecraft", "tui", "server", "paper", "purpur"]
+categories = ["command-line-utilities", "games"]
+
+[dependencies]
+ratatui = "0.29"
+crossterm = "0.28"
+anyhow = "1"
+clap = { version = "4", features = ["derive", "env"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+md-5 = "0.10"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+sysinfo = { version = "0.32", default-features = false, features = ["system"] }
+
+[profile.release]
+lto = "thin"
+strip = true
+codegen-units = 1
