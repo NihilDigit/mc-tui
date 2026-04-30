@@ -248,6 +248,26 @@ fn scan_worlds(server_dir: &Path, current_level: &str) -> Vec<WorldEntry> {
         });
     }
     out.sort_by(|a, b| b.is_current.cmp(&a.is_current).then(a.name.cmp(&b.name)));
+
+    // If `level-name` points at a world that hasn't been generated yet
+    // (e.g. user just hit `N` to create a new world; the dir + level.dat are
+    // produced on next server start), surface it as a placeholder so the UI
+    // doesn't look like the action did nothing.
+    if !current_level.is_empty() && !out.iter().any(|w| w.name == current_level) {
+        let target = server_dir.join(current_level);
+        out.insert(
+            0,
+            WorldEntry {
+                name: current_level.to_string(),
+                path: target,
+                size_bytes: 0,
+                last_modified: None,
+                is_current: true,
+                playerdata_count: 0,
+                has_level_dat: false,
+            },
+        );
+    }
     out
 }
 
@@ -283,14 +303,23 @@ fn write_ops(server_dir: &Path, entries: &[OpEntry]) -> Result<()> {
     Ok(())
 }
 
-fn server_running_pid(server_dir: &Path) -> Option<u32> {
-    use sysinfo::{ProcessRefreshKind, RefreshKind, System};
+/// Find the Java process running the Paper/Purpur/Spigot server in `server_dir`.
+///
+/// Why sticky: a single process scan can miss `cwd` for a process that's mid-fork,
+/// or hit them in a different iteration order between refreshes — both cause the
+/// returned pid to flicker between Some(p) and None (or between sibling pids if
+/// multiple jars are running). To avoid the status bar bouncing, prefer keeping
+/// the previously-observed pid as long as that pid still exists and still looks
+/// like our server.
+fn server_running_pid(server_dir: &Path, prev: Option<u32>) -> Option<u32> {
+    use sysinfo::{Pid, ProcessRefreshKind, RefreshKind, System};
     let mut sys = System::new_with_specifics(
         RefreshKind::new().with_processes(ProcessRefreshKind::everything()),
     );
     sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
     let canonical = server_dir.canonicalize().ok();
-    for (pid, proc) in sys.processes() {
+
+    let matches = |proc: &sysinfo::Process| -> bool {
         let cmd = proc.cmd();
         let has_jar = cmd.iter().any(|s| {
             let s = s.to_string_lossy();
@@ -298,18 +327,42 @@ fn server_running_pid(server_dir: &Path) -> Option<u32> {
                 && (s.contains("paper") || s.contains("purpur") || s.contains("spigot"))
         });
         if !has_jar {
-            continue;
+            return false;
         }
         let cwd = proc.cwd();
-        let matches = match (cwd, canonical.as_ref()) {
+        match (cwd, canonical.as_ref()) {
             (Some(cwd), Some(c)) => cwd == c.as_path(),
+            // If we couldn't read cwd this refresh, fall back to "is the cmd jar
+            // path absolute and inside server_dir?" — this covers `java -jar /srv/mc/purpur.jar`.
+            (None, Some(c)) => cmd.iter().any(|s| {
+                let s = s.to_string_lossy();
+                s.ends_with(".jar") && s.starts_with(c.to_string_lossy().as_ref())
+            }),
             _ => false,
-        };
-        if matches {
-            return Some(pid.as_u32());
+        }
+    };
+
+    // Sticky: if the previously-known pid still exists and matches, keep it.
+    if let Some(p) = prev {
+        if let Some(proc) = sys.process(Pid::from_u32(p)) {
+            if matches(proc) {
+                return Some(p);
+            }
         }
     }
-    None
+
+    // Otherwise pick the lowest matching pid for stability across re-scans.
+    let mut best: Option<u32> = None;
+    for (pid, proc) in sys.processes() {
+        if !matches(proc) {
+            continue;
+        }
+        let p = pid.as_u32();
+        if best.map(|b| p < b).unwrap_or(true) {
+            best = Some(p);
+        }
+    }
+    best
 }
 
 // ---------- i18n ----------
@@ -429,6 +482,41 @@ struct Strings {
     detail_value: &'static str,
     detail_yes: &'static str,
     detail_no: &'static str,
+
+    // v0.5 / v0.6 new tabs
+    title_yaml_files: &'static str,
+    title_yaml_edit_fmt: &'static str,
+    title_backups: &'static str,
+    title_rcon: &'static str,
+    title_server: &'static str,
+    hint_yaml_files: &'static str,
+    hint_yaml_edit: &'static str,
+    hint_backups: &'static str,
+    hint_rcon: &'static str,
+    hint_server: &'static str,
+    yaml_no_files: &'static str,
+    yaml_branch_marker: &'static str,
+    backups_none: &'static str,
+    backups_age_label: &'static str,
+    rcon_disabled_in_props: &'static str,
+    rcon_prompt_label: &'static str,
+    rcon_prompt_title: &'static str,
+    rcon_history_empty: &'static str,
+    rcon_response_label: &'static str,
+    server_action_restart_now: &'static str,
+    server_action_backup_now: &'static str,
+    server_action_sched_restart: &'static str,
+    server_action_sched_backup: &'static str,
+    server_action_pregen: &'static str,
+    server_action_systemd_status: &'static str,
+    server_action_attach: &'static str,
+    server_prompt_time_title: &'static str,
+    server_prompt_time_label: &'static str,
+    server_prompt_radius_title: &'static str,
+    server_prompt_radius_label: &'static str,
+    server_systemd_unit_dir: &'static str,
+    server_systemd_unit_dir_hint: &'static str,
+    server_pregen_no_running: &'static str,
 }
 
 const EN: Strings = Strings {
@@ -500,6 +588,39 @@ const EN: Strings = Strings {
     detail_value: "Value",
     detail_yes: "yes",
     detail_no: "no",
+    title_yaml_files: " YAML files (Enter = open) ",
+    title_yaml_edit_fmt: " YAML — ", // suffix is the file path
+    title_backups: " Backups ",
+    title_rcon: " RCON ",
+    title_server: " Server ops ",
+    hint_yaml_files: "↑/↓ select   Enter open   r refresh   Tab/1-9 tabs   q quit",
+    hint_yaml_edit: "↑/↓ select   Enter edit leaf   Esc back to files   r refresh   q quit",
+    hint_backups: "↑/↓ select   r refresh   Tab/1-9 tabs   q quit",
+    hint_rcon: "i type command   ↑/↓ scroll   r refresh   Tab/1-9 tabs   q quit",
+    hint_server: "↑/↓ select   Enter run   r refresh   Tab/1-9 tabs   q quit",
+    yaml_no_files: "(no known YAMLs in this server-dir)",
+    yaml_branch_marker: " ▸ ",
+    backups_none: "(no backups found in candidate dirs)",
+    backups_age_label: "Age",
+    rcon_disabled_in_props: "RCON is disabled. Set enable-rcon=true and rcon.password in server.properties, then restart.",
+    rcon_prompt_label: "command",
+    rcon_prompt_title: "RCON exec",
+    rcon_history_empty: "(no commands sent yet)",
+    rcon_response_label: "→",
+    server_action_restart_now: "Restart now (X then S)",
+    server_action_backup_now: "Run backup.sh now",
+    server_action_sched_restart: "Schedule daily restart…",
+    server_action_sched_backup: "Schedule daily backup…",
+    server_action_pregen: "Pre-generate chunks (RCON + chunky/worldborder)…",
+    server_action_systemd_status: "Show systemd unit paths",
+    server_action_attach: "Show `tmux attach` command",
+    server_prompt_time_title: "Daily time (HH:MM, 24h)",
+    server_prompt_time_label: "time",
+    server_prompt_radius_title: "Pre-gen radius (chunks from spawn)",
+    server_prompt_radius_label: "radius",
+    server_systemd_unit_dir: "systemd user units",
+    server_systemd_unit_dir_hint: "Run: systemctl --user daemon-reload && systemctl --user enable --now <name>.timer",
+    server_pregen_no_running: "✗ Server is not running — RCON requires a running server.",
 };
 
 const ZH: Strings = Strings {
@@ -571,6 +692,39 @@ const ZH: Strings = Strings {
     detail_value: "值",
     detail_yes: "是",
     detail_no: "否",
+    title_yaml_files: " YAML 文件 (Enter 打开) ",
+    title_yaml_edit_fmt: " YAML — ",
+    title_backups: " 备份 ",
+    title_rcon: " RCON ",
+    title_server: " 服务器运维 ",
+    hint_yaml_files: "↑/↓ 选择   Enter 打开   r 刷新   Tab/1-9 切页   q 退出",
+    hint_yaml_edit: "↑/↓ 选择   Enter 编辑叶子   Esc 返回   r 刷新   q 退出",
+    hint_backups: "↑/↓ 选择   r 刷新   Tab/1-9 切页   q 退出",
+    hint_rcon: "i 输入命令   ↑/↓ 滚动   r 刷新   Tab/1-9 切页   q 退出",
+    hint_server: "↑/↓ 选择   Enter 执行   r 刷新   Tab/1-9 切页   q 退出",
+    yaml_no_files: "(此服务器目录里没有已知 YAML)",
+    yaml_branch_marker: " ▸ ",
+    backups_none: "(候选目录里没找到备份)",
+    backups_age_label: "时间",
+    rcon_disabled_in_props: "RCON 未启用。请将 server.properties 中 enable-rcon=true 并设置 rcon.password，然后重启。",
+    rcon_prompt_label: "命令",
+    rcon_prompt_title: "RCON 执行",
+    rcon_history_empty: "(还没发过命令)",
+    rcon_response_label: "→",
+    server_action_restart_now: "立即重启 (X 然后 S)",
+    server_action_backup_now: "立即跑 backup.sh",
+    server_action_sched_restart: "设置每日定时重启…",
+    server_action_sched_backup: "设置每日定时备份…",
+    server_action_pregen: "区块预加载 (经 RCON 调 chunky/worldborder)…",
+    server_action_systemd_status: "显示 systemd unit 路径",
+    server_action_attach: "显示 `tmux attach` 命令",
+    server_prompt_time_title: "每日时间 (HH:MM, 24h 制)",
+    server_prompt_time_label: "时间",
+    server_prompt_radius_title: "预加载半径 (出生点附近 N 区块)",
+    server_prompt_radius_label: "半径",
+    server_systemd_unit_dir: "systemd 用户 unit",
+    server_systemd_unit_dir_hint: "执行: systemctl --user daemon-reload && systemctl --user enable --now <name>.timer",
+    server_pregen_no_running: "✗ 服务器未运行 — RCON 需要服务器在运行。",
 };
 
 // Parametric messages — return owned Strings.
@@ -583,10 +737,14 @@ fn tab_name(lang: Lang, id: TabId) -> &'static str {
         TabId::Ops => s.tab_ops,
         TabId::Config => s.tab_config,
         TabId::Logs => s.tab_logs,
+        TabId::Yaml => "YAML",
+        TabId::Backups => s.tab_backups,
+        TabId::Rcon => s.tab_rcon,
+        TabId::Server => s.tab_ops_panel,
     }
 }
 
-fn hint_for(lang: Lang, id: TabId) -> &'static str {
+fn hint_for(lang: Lang, id: TabId, yaml_view: &YamlView) -> &'static str {
     let s = lang.s();
     match id {
         TabId::Worlds => s.hint_worlds,
@@ -594,6 +752,26 @@ fn hint_for(lang: Lang, id: TabId) -> &'static str {
         TabId::Ops => s.hint_ops,
         TabId::Config => s.hint_config,
         TabId::Logs => s.hint_logs,
+        TabId::Yaml => match yaml_view {
+            YamlView::Files => s.hint_yaml_files,
+            YamlView::Editing { .. } => s.hint_yaml_edit,
+        },
+        TabId::Backups => s.hint_backups,
+        TabId::Rcon => s.hint_rcon,
+        TabId::Server => s.hint_server,
+    }
+}
+
+fn server_action_label(lang: Lang, a: ServerAction) -> &'static str {
+    let s = lang.s();
+    match a {
+        ServerAction::RestartNow => s.server_action_restart_now,
+        ServerAction::BackupNow => s.server_action_backup_now,
+        ServerAction::ScheduleDailyRestart => s.server_action_sched_restart,
+        ServerAction::ScheduleDailyBackup => s.server_action_sched_backup,
+        ServerAction::PreGenChunks => s.server_action_pregen,
+        ServerAction::OpenSystemdStatus => s.server_action_systemd_status,
+        ServerAction::ShowAttachCommand => s.server_action_attach,
     }
 }
 
@@ -1070,6 +1248,10 @@ enum TabId {
     Ops,
     Config,
     Logs,
+    Yaml,
+    Backups,
+    Rcon,
+    Server,
 }
 
 const TABS: &[(TabId, &str)] = &[
@@ -1078,7 +1260,40 @@ const TABS: &[(TabId, &str)] = &[
     (TabId::Ops, "Ops"),
     (TabId::Config, "Config"),
     (TabId::Logs, "Logs"),
+    (TabId::Yaml, "YAML"),
+    (TabId::Backups, "Backups"),
+    (TabId::Rcon, "RCON"),
+    (TabId::Server, "Server"),
 ];
+
+/// Server-tab actions (v0.6). Stable order — index used in events / tests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ServerAction {
+    RestartNow,
+    BackupNow,
+    ScheduleDailyRestart,
+    ScheduleDailyBackup,
+    PreGenChunks,
+    OpenSystemdStatus,
+    ShowAttachCommand,
+}
+
+const SERVER_ACTIONS: &[ServerAction] = &[
+    ServerAction::RestartNow,
+    ServerAction::BackupNow,
+    ServerAction::ShowAttachCommand,
+    ServerAction::ScheduleDailyRestart,
+    ServerAction::ScheduleDailyBackup,
+    ServerAction::PreGenChunks,
+    ServerAction::OpenSystemdStatus,
+];
+
+/// YAML tab toggles between file picker and a flat row editor for one file.
+#[derive(Debug, Clone)]
+enum YamlView {
+    Files,
+    Editing { file_idx: usize },
+}
 
 #[derive(Debug, Clone)]
 struct InputPrompt {
@@ -1095,6 +1310,11 @@ enum PromptAction {
     EditConfig(String),
     NewWorld,
     ChangeServerDir,
+    EditYaml,
+    RconCommand,
+    ScheduleDailyRestart,
+    ScheduleDailyBackup,
+    PreGenChunkRadius,
 }
 
 struct App {
@@ -1110,6 +1330,25 @@ struct App {
     whitelist_state: ListState,
     ops_state: ListState,
     config_state: ListState,
+
+    // v0.5 — YAML
+    yaml_files: Vec<PathBuf>,
+    yaml_files_state: ListState,
+    yaml_view: YamlView,
+    yaml_root: Option<serde_yaml::Value>,
+    yaml_rows: Vec<YamlRow>,
+    yaml_rows_state: ListState,
+
+    // v0.5 — Backups
+    backups: Vec<BackupEntry>,
+    backups_state: ListState,
+
+    // v0.5 — RCON
+    rcon_history: Vec<(String, String)>,
+    rcon_state: ListState,
+
+    // v0.6 — Server ops
+    server_state: ListState,
 
     status: String,
     prompt: Option<InputPrompt>,
@@ -1144,6 +1383,17 @@ impl App {
             whitelist_state: ListState::default(),
             ops_state: ListState::default(),
             config_state: ListState::default(),
+            yaml_files: Vec::new(),
+            yaml_files_state: ListState::default(),
+            yaml_view: YamlView::Files,
+            yaml_root: None,
+            yaml_rows: Vec::new(),
+            yaml_rows_state: ListState::default(),
+            backups: Vec::new(),
+            backups_state: ListState::default(),
+            rcon_history: Vec::new(),
+            rcon_state: ListState::default(),
+            server_state: ListState::default(),
             status: match lang {
                 Lang::En => String::from("Ready."),
                 Lang::Zh => String::from("就绪。"),
@@ -1166,6 +1416,13 @@ impl App {
         if !app.properties.is_empty() {
             app.config_state.select(Some(0));
         }
+        if !app.yaml_files.is_empty() {
+            app.yaml_files_state.select(Some(0));
+        }
+        if !app.backups.is_empty() {
+            app.backups_state.select(Some(0));
+        }
+        app.server_state.select(Some(0));
         Ok(app)
     }
 
@@ -1178,7 +1435,9 @@ impl App {
         self.worlds = scan_worlds(&self.server_dir, &cur);
         self.whitelist = read_whitelist(&self.server_dir).unwrap_or_default();
         self.ops = read_ops(&self.server_dir).unwrap_or_default();
-        self.pid = server_running_pid(&self.server_dir);
+        self.pid = server_running_pid(&self.server_dir, self.pid);
+        self.yaml_files = list_yaml_files(&self.server_dir);
+        self.backups = scan_backups(&self.server_dir);
     }
 
     fn list_state_for(&mut self, tab: TabId) -> &mut ListState {
@@ -1188,6 +1447,13 @@ impl App {
             TabId::Ops => &mut self.ops_state,
             TabId::Config => &mut self.config_state,
             TabId::Logs => &mut self.worlds_state,
+            TabId::Yaml => match self.yaml_view {
+                YamlView::Files => &mut self.yaml_files_state,
+                YamlView::Editing { .. } => &mut self.yaml_rows_state,
+            },
+            TabId::Backups => &mut self.backups_state,
+            TabId::Rcon => &mut self.rcon_state,
+            TabId::Server => &mut self.server_state,
         }
     }
 
@@ -1198,6 +1464,13 @@ impl App {
             TabId::Ops => self.ops.len(),
             TabId::Config => self.properties.len(),
             TabId::Logs => 0,
+            TabId::Yaml => match self.yaml_view {
+                YamlView::Files => self.yaml_files.len(),
+                YamlView::Editing { .. } => self.yaml_rows.len(),
+            },
+            TabId::Backups => self.backups.len(),
+            TabId::Rcon => self.rcon_history.len(),
+            TabId::Server => SERVER_ACTIONS.len(),
         }
     }
 
@@ -1329,6 +1602,323 @@ impl App {
         Ok(())
     }
 
+    // -- v0.5: YAML --
+
+    fn yaml_open(&mut self, idx: usize) -> Result<()> {
+        let Some(path) = self.yaml_files.get(idx).cloned() else { return Ok(()) };
+        let raw = fs::read_to_string(&path)
+            .with_context(|| format!("read {}", path.display()))?;
+        let value: serde_yaml::Value = serde_yaml::from_str(&raw)
+            .with_context(|| format!("parse YAML {}", path.display()))?;
+        self.yaml_rows = flatten_yaml(&value);
+        self.yaml_root = Some(value);
+        self.yaml_view = YamlView::Editing { file_idx: idx };
+        self.yaml_rows_state = ListState::default();
+        if !self.yaml_rows.is_empty() {
+            self.yaml_rows_state.select(Some(0));
+        }
+        self.status = match self.lang {
+            Lang::En => format!("✓ Opened {}", path.display()),
+            Lang::Zh => format!("✓ 已打开 {}", path.display()),
+        };
+        Ok(())
+    }
+
+    fn yaml_close(&mut self) {
+        self.yaml_view = YamlView::Files;
+        self.yaml_root = None;
+        self.yaml_rows.clear();
+    }
+
+    fn yaml_save_current(&mut self, value_str: &str) -> Result<()> {
+        let YamlView::Editing { file_idx } = self.yaml_view.clone() else { return Ok(()) };
+        let Some(idx) = self.yaml_rows_state.selected() else { return Ok(()) };
+        let Some(row) = self.yaml_rows.get(idx).cloned() else { return Ok(()) };
+        let Some(root) = self.yaml_root.as_mut() else { return Ok(()) };
+        yaml_set(root, &row.path, parse_yaml_scalar(value_str))?;
+        // Persist back to disk.
+        let path = self
+            .yaml_files
+            .get(file_idx)
+            .cloned()
+            .context("yaml file index out of range")?;
+        let dumped = serde_yaml::to_string(root).context("serialize YAML")?;
+        fs::write(&path, dumped).with_context(|| format!("write {}", path.display()))?;
+        // Re-flatten so the row's display value updates.
+        self.yaml_rows = flatten_yaml(root);
+        if !self.yaml_rows.is_empty() {
+            self.yaml_rows_state.select(Some(idx.min(self.yaml_rows.len() - 1)));
+        }
+        self.status = match self.lang {
+            Lang::En => format!("✓ Wrote {}", path.display()),
+            Lang::Zh => format!("✓ 已写入 {}", path.display()),
+        };
+        Ok(())
+    }
+
+    // -- v0.5: RCON --
+
+    fn rcon_send(&mut self, cmd: &str) -> Result<()> {
+        let cmd = cmd.trim();
+        if cmd.is_empty() {
+            return Ok(());
+        }
+        if self.pid.is_none() {
+            self.status = self.lang.s().server_pregen_no_running.into();
+            return Ok(());
+        }
+        let Some((host, port, password)) = rcon_settings(&self.properties) else {
+            self.status = self.lang.s().rcon_disabled_in_props.into();
+            return Ok(());
+        };
+        match RconClient::connect(&host, port, &password)
+            .and_then(|mut c| c.exec(cmd))
+        {
+            Ok(resp) => {
+                self.rcon_history.push((cmd.to_string(), resp));
+                self.status = match self.lang {
+                    Lang::En => "✓ RCON ok".into(),
+                    Lang::Zh => "✓ RCON 已执行".into(),
+                };
+            }
+            Err(e) => {
+                self.status = match self.lang {
+                    Lang::En => format!("✗ RCON: {}", e),
+                    Lang::Zh => format!("✗ RCON 失败：{}", e),
+                };
+            }
+        }
+        // Auto-scroll to last entry.
+        if !self.rcon_history.is_empty() {
+            self.rcon_state.select(Some(self.rcon_history.len() - 1));
+        }
+        Ok(())
+    }
+
+    // -- v0.6: Server ops --
+
+    fn backup_now(&mut self) -> Result<()> {
+        let script = self.server_dir.join("backup.sh");
+        if !script.exists() {
+            self.status = match self.lang {
+                Lang::En => format!("✗ {} not found", script.display()),
+                Lang::Zh => format!("✗ {} 不存在", script.display()),
+            };
+            return Ok(());
+        }
+        use std::process::{Command, Stdio};
+        let res = Command::new("bash")
+            .arg(&script)
+            .current_dir(&self.server_dir)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn();
+        match res {
+            Ok(_) => {
+                self.status = match self.lang {
+                    Lang::En => "→ Spawned backup.sh in background.".into(),
+                    Lang::Zh => "→ 已后台启动 backup.sh。".into(),
+                };
+            }
+            Err(e) => {
+                self.status = match self.lang {
+                    Lang::En => format!("✗ spawn failed: {}", e),
+                    Lang::Zh => format!("✗ 启动失败：{}", e),
+                };
+            }
+        }
+        Ok(())
+    }
+
+    fn restart_now(&mut self) -> Result<()> {
+        if let Some(pid) = self.pid {
+            self.stop_server()?;
+            // Wait briefly for graceful shutdown.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            while std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(500));
+                if server_running_pid(&self.server_dir, Some(pid)).is_none() {
+                    break;
+                }
+            }
+            self.pid = server_running_pid(&self.server_dir, None);
+            if self.pid == Some(pid) {
+                self.status = match self.lang {
+                    Lang::En => "⚠ stop timed out — start cancelled.".into(),
+                    Lang::Zh => "⚠ 停止超时 — 已取消启动。".into(),
+                };
+                return Ok(());
+            }
+        }
+        self.start_server()
+    }
+
+    fn schedule_daily(&mut self, kind: ServerAction, time: &str) -> Result<()> {
+        let (hour, minute) = match parse_hh_mm(time) {
+            Some(t) => t,
+            None => {
+                self.status = match self.lang {
+                    Lang::En => format!("✗ Invalid time '{}'. Expected HH:MM.", time),
+                    Lang::Zh => format!("✗ 时间格式非法：'{}'。预期 HH:MM。", time),
+                };
+                return Ok(());
+            }
+        };
+        let (unit_name, command, description) = match kind {
+            ServerAction::ScheduleDailyRestart => (
+                format!("mc-tui-restart-{}", server_dir_slug(&self.server_dir)),
+                format!(
+                    "/usr/bin/env bash -c 'cd {0:?} && (test -x ./stop.sh && ./stop.sh || pkill -TERM -f \"java.*paper\\|purpur\"; sleep 30; setsid bash {0:?}/start.sh)'",
+                    self.server_dir
+                ),
+                "mc-tui daily restart".to_string(),
+            ),
+            ServerAction::ScheduleDailyBackup => (
+                format!("mc-tui-backup-{}", server_dir_slug(&self.server_dir)),
+                format!("/usr/bin/env bash {:?}/backup.sh", self.server_dir),
+                "mc-tui daily backup".to_string(),
+            ),
+            _ => return Ok(()),
+        };
+        let unit_dir = config_dir().parent().unwrap_or(Path::new(".")).join("systemd").join("user");
+        if let Err(e) = fs::create_dir_all(&unit_dir) {
+            self.status = match self.lang {
+                Lang::En => format!("✗ create {}: {}", unit_dir.display(), e),
+                Lang::Zh => format!("✗ 创建 {} 失败：{}", unit_dir.display(), e),
+            };
+            return Ok(());
+        }
+        let service = format!(
+            "[Unit]\nDescription={desc}\n\n[Service]\nType=oneshot\nWorkingDirectory={cwd:?}\nExecStart={cmd}\n",
+            desc = description,
+            cwd = self.server_dir,
+            cmd = command
+        );
+        let timer = format!(
+            "[Unit]\nDescription={desc} timer\n\n[Timer]\nOnCalendar=*-*-* {h:02}:{m:02}:00\nPersistent=true\nUnit={name}.service\n\n[Install]\nWantedBy=timers.target\n",
+            desc = description,
+            h = hour,
+            m = minute,
+            name = unit_name
+        );
+        let svc_path = unit_dir.join(format!("{}.service", unit_name));
+        let tim_path = unit_dir.join(format!("{}.timer", unit_name));
+        if let Err(e) = fs::write(&svc_path, &service).and_then(|_| fs::write(&tim_path, &timer)) {
+            self.status = match self.lang {
+                Lang::En => format!("✗ write unit: {}", e),
+                Lang::Zh => format!("✗ 写入 unit 失败：{}", e),
+            };
+            return Ok(());
+        }
+        self.status = match self.lang {
+            Lang::En => format!(
+                "✓ Wrote {} + .timer. Then: systemctl --user daemon-reload && systemctl --user enable --now {}.timer",
+                svc_path.display(),
+                unit_name
+            ),
+            Lang::Zh => format!(
+                "✓ 已写入 {} 和 .timer。下一步：systemctl --user daemon-reload && systemctl --user enable --now {}.timer",
+                svc_path.display(),
+                unit_name
+            ),
+        };
+        Ok(())
+    }
+
+    fn pregen_chunks(&mut self, radius_str: &str) -> Result<()> {
+        let radius: i32 = match radius_str.trim().parse() {
+            Ok(n) if n > 0 && n <= 5000 => n,
+            _ => {
+                self.status = match self.lang {
+                    Lang::En => format!("✗ Invalid radius '{}' (1–5000)", radius_str),
+                    Lang::Zh => format!("✗ 非法半径 '{}'（应在 1–5000）", radius_str),
+                };
+                return Ok(());
+            }
+        };
+        if self.pid.is_none() {
+            self.status = self.lang.s().server_pregen_no_running.into();
+            return Ok(());
+        }
+        let Some((host, port, password)) = rcon_settings(&self.properties) else {
+            self.status = self.lang.s().rcon_disabled_in_props.into();
+            return Ok(());
+        };
+        let mut client = match RconClient::connect(&host, port, &password) {
+            Ok(c) => c,
+            Err(e) => {
+                self.status = match self.lang {
+                    Lang::En => format!("✗ RCON connect: {}", e),
+                    Lang::Zh => format!("✗ RCON 连接失败：{}", e),
+                };
+                return Ok(());
+            }
+        };
+        // Try chunky first (most efficient); fall back to vanilla worldborder.
+        let level = self.current_level().to_string();
+        let cmds = vec![
+            format!("chunky world {}", level),
+            format!("chunky center 0 0"),
+            format!("chunky radius {}", radius),
+            format!("chunky start"),
+        ];
+        let mut log = String::new();
+        for c in &cmds {
+            match client.exec(c) {
+                Ok(r) => log.push_str(&format!("$ {}\n{}\n", c, r)),
+                Err(e) => {
+                    log.push_str(&format!("$ {} → ERR {}\n", c, e));
+                    break;
+                }
+            }
+        }
+        self.rcon_history.push(("(pre-gen chunks)".into(), log));
+        if !self.rcon_history.is_empty() {
+            self.rcon_state.select(Some(self.rcon_history.len() - 1));
+        }
+        self.status = match self.lang {
+            Lang::En => format!("✓ Pre-gen sent (radius {}). Watch RCON tab for progress.", radius),
+            Lang::Zh => format!("✓ 已发送区块预加载（半径 {}）。在 RCON 页查看进度。", radius),
+        };
+        Ok(())
+    }
+
+    fn show_attach_command(&mut self) {
+        let session = tmux_session_name(&self.server_dir);
+        let cmd = format!("tmux attach -t {}", session);
+        let alive = which("tmux").is_some() && tmux_session_alive(&session);
+        // Best-effort copy to wl-clipboard; ignore failures (e.g. headless / no wayland).
+        let _ = std::process::Command::new("wl-copy")
+            .arg(&cmd)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+        self.status = match (self.lang, alive) {
+            (Lang::En, true) => format!("ℹ Copied to clipboard: {}", cmd),
+            (Lang::En, false) => format!("ℹ {} (session not yet alive)", cmd),
+            (Lang::Zh, true) => format!("ℹ 已复制到剪贴板：{}", cmd),
+            (Lang::Zh, false) => format!("ℹ {}（会话尚未启动）", cmd),
+        };
+    }
+
+    fn show_systemd_status(&mut self) {
+        let unit_dir = config_dir().parent().unwrap_or(Path::new(".")).join("systemd").join("user");
+        self.status = match self.lang {
+            Lang::En => format!(
+                "ℹ {}: {} | run: systemctl --user list-timers",
+                self.lang.s().server_systemd_unit_dir,
+                unit_dir.display()
+            ),
+            Lang::Zh => format!(
+                "ℹ {}: {} ｜ 命令: systemctl --user list-timers",
+                self.lang.s().server_systemd_unit_dir,
+                unit_dir.display()
+            ),
+        };
+    }
+
     fn save_config_value(&mut self, key: &str, value: &str) -> Result<()> {
         set_property(&mut self.properties, key, value);
         write_properties(&self.server_dir.join("server.properties"), &self.properties)?;
@@ -1349,8 +1939,67 @@ impl App {
             return Ok(());
         }
         use std::process::{Command, Stdio};
-        // Use `setsid` on unix to detach the child into its own session so closing mc-tui doesn't HUP it.
-        // Fall back to plain bash on platforms without setsid.
+
+        // Preferred: launch inside a detached tmux session so we can later send
+        // the `stop` console command — it runs Minecraft's own shutdown path
+        // (synchronous save on the main thread) instead of relying on JVM
+        // signal handlers, which we've seen race with startup and end up half-dead.
+        let session = tmux_session_name(&self.server_dir);
+        if which("tmux").is_some() {
+            // Re-attach situation: if a session by this name already exists,
+            // assume it's our previous server and tell the user.
+            if tmux_session_alive(&session) {
+                self.status = match self.lang {
+                    Lang::En => format!(
+                        "→ tmux session '{}' already exists. Attach with: tmux attach -t {}",
+                        session, session
+                    ),
+                    Lang::Zh => format!(
+                        "→ tmux 会话 '{}' 已存在。接管：tmux attach -t {}",
+                        session, session
+                    ),
+                };
+                return Ok(());
+            }
+            let cmd_str = format!("bash {}", script.display());
+            let res = Command::new("tmux")
+                .arg("new-session")
+                .arg("-d")
+                .arg("-s")
+                .arg(&session)
+                .arg("-c")
+                .arg(&self.server_dir)
+                .arg(&cmd_str)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+            match res {
+                Ok(s) if s.success() => {
+                    self.status = match self.lang {
+                        Lang::En => format!(
+                            "✓ Started in tmux session '{}'. Attach: tmux attach -t {}",
+                            session, session
+                        ),
+                        Lang::Zh => format!(
+                            "✓ 已在 tmux 会话 '{}' 中启动。接管：tmux attach -t {}",
+                            session, session
+                        ),
+                    };
+                    return Ok(());
+                }
+                Ok(s) => {
+                    self.status = fmt_spawn_failed(self.lang, &format!("tmux exited {:?}", s.code()));
+                    return Ok(());
+                }
+                Err(e) => {
+                    self.status = fmt_spawn_failed(self.lang, &e.to_string());
+                    return Ok(());
+                }
+            }
+        }
+
+        // Fallback: setsid bash (no console — `stop` will rely on SIGTERM and may race).
         let mut cmd = if cfg!(unix) && which("setsid").is_some() {
             let mut c = Command::new("setsid");
             c.arg("bash").arg(&script);
@@ -1377,6 +2026,44 @@ impl App {
             return Ok(());
         };
         use std::process::Command;
+
+        // Prefer the tmux console — `stop` runs Minecraft's own shutdown handler
+        // on the main server thread, which is the only path that's reliable.
+        let session = tmux_session_name(&self.server_dir);
+        if which("tmux").is_some() && tmux_session_alive(&session) {
+            let res = Command::new("tmux")
+                .args(["send-keys", "-t", &session, "stop", "Enter"])
+                .status();
+            match res {
+                Ok(s) if s.success() => {
+                    self.status = match self.lang {
+                        Lang::En => format!(
+                            "→ Sent `stop` to tmux session '{}'. Watching for exit…",
+                            session
+                        ),
+                        Lang::Zh => format!(
+                            "→ 已向 tmux 会话 '{}' 发送 `stop`，等待退出…",
+                            session
+                        ),
+                    };
+                    return Ok(());
+                }
+                Ok(s) => {
+                    self.status = fmt_kill_failed(
+                        self.lang,
+                        &format!("tmux send-keys exited {:?}", s.code()),
+                    );
+                    return Ok(());
+                }
+                Err(e) => {
+                    self.status = fmt_kill_failed(self.lang, &e.to_string());
+                    return Ok(());
+                }
+            }
+        }
+
+        // Fallback: SIGTERM the detected pid. JVM shutdown hook may stall under
+        // race conditions; if so, the user can SIGKILL manually.
         #[cfg(unix)]
         let res = Command::new("kill").arg("-TERM").arg(pid.to_string()).status();
         #[cfg(not(unix))]
@@ -1482,6 +2169,43 @@ impl App {
     }
 }
 
+fn parse_hh_mm(s: &str) -> Option<(u8, u8)> {
+    let s = s.trim();
+    let mut parts = s.splitn(2, ':');
+    let h: u8 = parts.next()?.parse().ok()?;
+    let m: u8 = parts.next()?.parse().ok()?;
+    if h >= 24 || m >= 60 {
+        return None;
+    }
+    Some((h, m))
+}
+
+/// Stable tmux session name keyed off the server-dir basename.
+/// Same dir → same session every time, so `start` / `stop` find the same place.
+fn tmux_session_name(server_dir: &Path) -> String {
+    format!("mc-tui-{}", server_dir_slug(server_dir))
+}
+
+fn tmux_session_alive(name: &str) -> bool {
+    use std::process::{Command, Stdio};
+    Command::new("tmux")
+        .args(["has-session", "-t", name])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+fn server_dir_slug(p: &Path) -> String {
+    p.file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("server")
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c.to_ascii_lowercase() } else { '-' })
+        .collect()
+}
+
 fn which(prog: &str) -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;
     for dir in std::env::split_paths(&path) {
@@ -1530,6 +2254,10 @@ fn ui(f: &mut Frame, app: &mut App) {
         TabId::Ops => draw_ops(f, chunks[2], app),
         TabId::Config => draw_config(f, chunks[2], app),
         TabId::Logs => draw_logs(f, chunks[2], app),
+        TabId::Yaml => draw_yaml(f, chunks[2], app),
+        TabId::Backups => draw_backups(f, chunks[2], app),
+        TabId::Rcon => draw_rcon(f, chunks[2], app),
+        TabId::Server => draw_server(f, chunks[2], app),
     }
     draw_hints(f, chunks[3], app);
 
@@ -1914,8 +2642,204 @@ fn draw_logs(f: &mut Frame, area: Rect, app: &App) {
     f.render_widget(p, area);
 }
 
+fn draw_yaml(f: &mut Frame, area: Rect, app: &mut App) {
+    let s = app.lang.s();
+    match &app.yaml_view {
+        YamlView::Files => {
+            let items: Vec<ListItem> = if app.yaml_files.is_empty() {
+                vec![ListItem::new(Line::from(Span::styled(
+                    s.yaml_no_files,
+                    Style::default().fg(Color::DarkGray),
+                )))]
+            } else {
+                app.yaml_files
+                    .iter()
+                    .map(|p| {
+                        let display = p
+                            .strip_prefix(&app.server_dir)
+                            .unwrap_or(p)
+                            .display()
+                            .to_string();
+                        ListItem::new(Line::from(Span::styled(
+                            format!(" {}", display),
+                            Style::default().fg(Color::White),
+                        )))
+                    })
+                    .collect()
+            };
+            let list = List::new(items)
+                .block(Block::default().borders(Borders::ALL).title(s.title_yaml_files))
+                .highlight_style(Style::default().bg(Color::Blue).add_modifier(Modifier::BOLD))
+                .highlight_symbol("> ");
+            f.render_stateful_widget(list, area, &mut app.yaml_files_state);
+        }
+        YamlView::Editing { file_idx } => {
+            let path = app
+                .yaml_files
+                .get(*file_idx)
+                .cloned()
+                .unwrap_or_default();
+            let title = format!("{}{} ", s.title_yaml_edit_fmt, path.display());
+            let items: Vec<ListItem> = app
+                .yaml_rows
+                .iter()
+                .map(|row| {
+                    let indent_str: String = (0..row.indent).map(|_| "  ").collect();
+                    let mut spans = vec![
+                        Span::raw(" "),
+                        Span::raw(indent_str),
+                        Span::styled(row.label.clone(), Style::default().fg(Color::White)),
+                    ];
+                    match &row.value {
+                        YamlDisplay::Branch => {
+                            spans.push(Span::styled(
+                                s.yaml_branch_marker,
+                                Style::default().fg(Color::DarkGray),
+                            ));
+                        }
+                        YamlDisplay::Scalar(v) => {
+                            spans.push(Span::raw(": "));
+                            let color = match v.as_str() {
+                                "true" => Color::Green,
+                                "false" => Color::Red,
+                                _ => Color::Cyan,
+                            };
+                            spans.push(Span::styled(v.clone(), Style::default().fg(color)));
+                        }
+                    }
+                    ListItem::new(Line::from(spans))
+                })
+                .collect();
+            let list = List::new(items)
+                .block(Block::default().borders(Borders::ALL).title(title))
+                .highlight_style(Style::default().bg(Color::Blue).add_modifier(Modifier::BOLD))
+                .highlight_symbol("> ");
+            f.render_stateful_widget(list, area, &mut app.yaml_rows_state);
+        }
+    }
+}
+
+fn draw_backups(f: &mut Frame, area: Rect, app: &mut App) {
+    let s = app.lang.s();
+    let items: Vec<ListItem> = if app.backups.is_empty() {
+        vec![ListItem::new(Line::from(Span::styled(
+            s.backups_none,
+            Style::default().fg(Color::DarkGray),
+        )))]
+    } else {
+        let now = chrono::Local::now();
+        app.backups
+            .iter()
+            .map(|b| {
+                let age = b
+                    .modified
+                    .map(|t| fmt_age(now - t))
+                    .unwrap_or_else(|| "?".into());
+                let when = b
+                    .modified
+                    .map(|t| t.format("%Y-%m-%d %H:%M").to_string())
+                    .unwrap_or_default();
+                ListItem::new(Line::from(vec![
+                    Span::styled(format!(" {:40}", b.name), Style::default().fg(Color::White)),
+                    Span::styled(
+                        format!("{:>10}  ", fmt_bytes(b.size_bytes)),
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                    Span::styled(when, Style::default().fg(Color::DarkGray)),
+                    Span::raw("  "),
+                    Span::styled(age, Style::default().fg(Color::Yellow)),
+                ]))
+            })
+            .collect()
+    };
+    let list = List::new(items)
+        .block(Block::default().borders(Borders::ALL).title(s.title_backups))
+        .highlight_style(Style::default().bg(Color::Blue).add_modifier(Modifier::BOLD))
+        .highlight_symbol("> ");
+    f.render_stateful_widget(list, area, &mut app.backups_state);
+}
+
+fn fmt_age(d: chrono::Duration) -> String {
+    let total_secs = d.num_seconds().max(0);
+    if total_secs < 60 {
+        format!("{}s ago", total_secs)
+    } else if total_secs < 3600 {
+        format!("{}m ago", total_secs / 60)
+    } else if total_secs < 86400 {
+        format!("{}h ago", total_secs / 3600)
+    } else if total_secs < 86400 * 60 {
+        format!("{}d ago", total_secs / 86400)
+    } else {
+        format!("{}mo ago", total_secs / (86400 * 30))
+    }
+}
+
+fn draw_rcon(f: &mut Frame, area: Rect, app: &mut App) {
+    let s = app.lang.s();
+    let enabled = rcon_settings(&app.properties).is_some();
+    if !enabled {
+        let p = Paragraph::new(Line::from(Span::styled(
+            s.rcon_disabled_in_props,
+            Style::default().fg(Color::Yellow),
+        )))
+        .block(Block::default().borders(Borders::ALL).title(s.title_rcon))
+        .wrap(Wrap { trim: false });
+        f.render_widget(p, area);
+        return;
+    }
+    let items: Vec<ListItem> = if app.rcon_history.is_empty() {
+        vec![ListItem::new(Line::from(Span::styled(
+            s.rcon_history_empty,
+            Style::default().fg(Color::DarkGray),
+        )))]
+    } else {
+        app.rcon_history
+            .iter()
+            .flat_map(|(cmd, resp)| {
+                let mut out = vec![ListItem::new(Line::from(vec![
+                    Span::styled(" $ ", Style::default().fg(Color::Green)),
+                    Span::styled(cmd.clone(), Style::default().fg(Color::White)),
+                ]))];
+                for line in resp.lines() {
+                    out.push(ListItem::new(Line::from(vec![
+                        Span::styled(
+                            format!(" {} ", s.rcon_response_label),
+                            Style::default().fg(Color::DarkGray),
+                        ),
+                        Span::styled(line.to_string(), Style::default().fg(Color::Cyan)),
+                    ])));
+                }
+                out
+            })
+            .collect()
+    };
+    let list = List::new(items)
+        .block(Block::default().borders(Borders::ALL).title(s.title_rcon))
+        .highlight_style(Style::default().bg(Color::Blue).add_modifier(Modifier::BOLD))
+        .highlight_symbol("> ");
+    f.render_stateful_widget(list, area, &mut app.rcon_state);
+}
+
+fn draw_server(f: &mut Frame, area: Rect, app: &mut App) {
+    let s = app.lang.s();
+    let items: Vec<ListItem> = SERVER_ACTIONS
+        .iter()
+        .map(|a| {
+            ListItem::new(Line::from(vec![
+                Span::raw(" "),
+                Span::styled(server_action_label(app.lang, *a), Style::default().fg(Color::White)),
+            ]))
+        })
+        .collect();
+    let list = List::new(items)
+        .block(Block::default().borders(Borders::ALL).title(s.title_server))
+        .highlight_style(Style::default().bg(Color::Blue).add_modifier(Modifier::BOLD))
+        .highlight_symbol("> ");
+    f.render_stateful_widget(list, area, &mut app.server_state);
+}
+
 fn draw_hints(f: &mut Frame, area: Rect, app: &App) {
-    let hint = hint_for(app.lang, app.tab);
+    let hint = hint_for(app.lang, app.tab, &app.yaml_view);
     let line = Line::from(vec![
         Span::styled(format!(" {} ", hint), Style::default().fg(Color::DarkGray)),
         Span::raw("  │  "),
@@ -1972,7 +2896,7 @@ fn run<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<()> {
         terminal.draw(|f| ui(f, app))?;
 
         if !event::poll(Duration::from_millis(500))? {
-            app.pid = server_running_pid(&app.server_dir);
+            app.pid = server_running_pid(&app.server_dir, app.pid);
             continue;
         }
 
@@ -2002,6 +2926,22 @@ fn run<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<()> {
                         PromptAction::EditConfig(key) => app.save_config_value(&key, &value)?,
                         PromptAction::NewWorld => app.create_new_world(&value)?,
                         PromptAction::ChangeServerDir => app.change_server_dir(&value)?,
+                        PromptAction::EditYaml => {
+                            if let Err(e) = app.yaml_save_current(&value) {
+                                app.status = match app.lang {
+                                    Lang::En => format!("✗ {}", e),
+                                    Lang::Zh => format!("✗ {}", e),
+                                };
+                            }
+                        }
+                        PromptAction::RconCommand => app.rcon_send(&value)?,
+                        PromptAction::ScheduleDailyRestart => {
+                            app.schedule_daily(ServerAction::ScheduleDailyRestart, &value)?
+                        }
+                        PromptAction::ScheduleDailyBackup => {
+                            app.schedule_daily(ServerAction::ScheduleDailyBackup, &value)?
+                        }
+                        PromptAction::PreGenChunkRadius => app.pregen_chunks(&value)?,
                     }
                 }
                 KeyCode::Backspace => {
@@ -2020,12 +2960,26 @@ fn run<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<()> {
         }
 
         match key.code {
-            KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
+            KeyCode::Char('q') => return Ok(()),
+            KeyCode::Esc => {
+                // In YAML editing view, Esc returns to file picker instead of quitting.
+                if app.tab == TabId::Yaml {
+                    if let YamlView::Editing { .. } = app.yaml_view {
+                        app.yaml_close();
+                        continue;
+                    }
+                }
+                return Ok(());
+            }
             KeyCode::Char('1') => app.switch_tab(TabId::Worlds),
             KeyCode::Char('2') => app.switch_tab(TabId::Whitelist),
             KeyCode::Char('3') => app.switch_tab(TabId::Ops),
             KeyCode::Char('4') => app.switch_tab(TabId::Config),
             KeyCode::Char('5') => app.switch_tab(TabId::Logs),
+            KeyCode::Char('6') => app.switch_tab(TabId::Yaml),
+            KeyCode::Char('7') => app.switch_tab(TabId::Backups),
+            KeyCode::Char('8') => app.switch_tab(TabId::Rcon),
+            KeyCode::Char('9') => app.switch_tab(TabId::Server),
             KeyCode::Tab => app.cycle_tab(1),
             KeyCode::BackTab => app.cycle_tab(-1),
             KeyCode::Char('r') => {
@@ -2049,6 +3003,43 @@ fn run<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<()> {
                                 buffer: v,
                                 action: PromptAction::EditConfig(k),
                             });
+                        }
+                    }
+                }
+                TabId::Yaml => match app.yaml_view.clone() {
+                    YamlView::Files => {
+                        if let Some(idx) = app.yaml_files_state.selected() {
+                            if let Err(e) = app.yaml_open(idx) {
+                                app.status = match app.lang {
+                                    Lang::En => format!("✗ {}", e),
+                                    Lang::Zh => format!("✗ {}", e),
+                                };
+                            }
+                        }
+                    }
+                    YamlView::Editing { .. } => {
+                        if let Some(idx) = app.yaml_rows_state.selected() {
+                            if let Some(row) = app.yaml_rows.get(idx).cloned() {
+                                if let YamlDisplay::Scalar(v) = &row.value {
+                                    let title = match app.lang {
+                                        Lang::En => format!("Edit {}", row.label),
+                                        Lang::Zh => format!("编辑 {}", row.label),
+                                    };
+                                    app.prompt = Some(InputPrompt {
+                                        title,
+                                        label: app.lang.s().prompt_label_value.into(),
+                                        buffer: v.clone(),
+                                        action: PromptAction::EditYaml,
+                                    });
+                                }
+                            }
+                        }
+                    }
+                },
+                TabId::Server => {
+                    if let Some(idx) = app.server_state.selected() {
+                        if let Some(action) = SERVER_ACTIONS.get(idx).copied() {
+                            handle_server_action(app, action)?;
                         }
                     }
                 }
@@ -2115,7 +3106,66 @@ fn run<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<()> {
                     action: PromptAction::ChangeServerDir,
                 });
             }
+            // RCON: 'i' opens command prompt in RCON tab
+            KeyCode::Char('i') => {
+                if app.tab == TabId::Rcon {
+                    if rcon_settings(&app.properties).is_some() {
+                        let s = app.lang.s();
+                        app.prompt = Some(InputPrompt {
+                            title: s.rcon_prompt_title.into(),
+                            label: s.rcon_prompt_label.into(),
+                            buffer: String::new(),
+                            action: PromptAction::RconCommand,
+                        });
+                    } else {
+                        app.status = app.lang.s().rcon_disabled_in_props.into();
+                    }
+                }
+            }
             _ => {}
+        }
+    }
+}
+
+fn handle_server_action(app: &mut App, a: ServerAction) -> Result<()> {
+    let s = app.lang.s();
+    match a {
+        ServerAction::RestartNow => app.restart_now(),
+        ServerAction::BackupNow => app.backup_now(),
+        ServerAction::ScheduleDailyRestart => {
+            app.prompt = Some(InputPrompt {
+                title: s.server_prompt_time_title.into(),
+                label: s.server_prompt_time_label.into(),
+                buffer: "04:00".into(),
+                action: PromptAction::ScheduleDailyRestart,
+            });
+            Ok(())
+        }
+        ServerAction::ScheduleDailyBackup => {
+            app.prompt = Some(InputPrompt {
+                title: s.server_prompt_time_title.into(),
+                label: s.server_prompt_time_label.into(),
+                buffer: "03:30".into(),
+                action: PromptAction::ScheduleDailyBackup,
+            });
+            Ok(())
+        }
+        ServerAction::PreGenChunks => {
+            app.prompt = Some(InputPrompt {
+                title: s.server_prompt_radius_title.into(),
+                label: s.server_prompt_radius_label.into(),
+                buffer: "1000".into(),
+                action: PromptAction::PreGenChunkRadius,
+            });
+            Ok(())
+        }
+        ServerAction::OpenSystemdStatus => {
+            app.show_systemd_status();
+            Ok(())
+        }
+        ServerAction::ShowAttachCommand => {
+            app.show_attach_command();
+            Ok(())
         }
     }
 }
@@ -3022,6 +4072,10 @@ fn render_screenshot(
         "ops" => TabId::Ops,
         "config" => TabId::Config,
         "logs" => TabId::Logs,
+        "yaml" => TabId::Yaml,
+        "backups" => TabId::Backups,
+        "rcon" => TabId::Rcon,
+        "server" => TabId::Server,
         other => anyhow::bail!("unknown tab: {}", other),
     };
     // Allow QA to highlight a specific row to inspect its detail panel.
@@ -3384,6 +4438,91 @@ Java(TM) SE Runtime Environment ..."#;
         assert!(names.contains(&"snap-1.tar.gz".to_string()));
         assert!(names.contains(&"snap-2.zip".to_string()));
         assert!(!names.contains(&"not-a-backup.txt".to_string()));
+    }
+
+    #[test]
+    fn scan_worlds_inserts_placeholder_for_pending_level_name() {
+        let dir = tempdir();
+        // existing world with level.dat
+        let w1 = dir.join("world");
+        fs::create_dir_all(&w1).unwrap();
+        fs::write(w1.join("level.dat"), b"x").unwrap();
+
+        // current level-name points at a world that doesn't exist yet
+        let out = scan_worlds(&dir, "fresh-world");
+        assert_eq!(out.len(), 2);
+        // placeholder should be first (sorted current-first) and is_current
+        assert_eq!(out[0].name, "fresh-world");
+        assert!(out[0].is_current);
+        assert!(!out[0].has_level_dat);
+        assert_eq!(out[1].name, "world");
+        assert!(!out[1].is_current);
+    }
+
+    #[test]
+    fn scan_worlds_no_placeholder_when_level_name_exists() {
+        let dir = tempdir();
+        let w1 = dir.join("world");
+        fs::create_dir_all(&w1).unwrap();
+        fs::write(w1.join("level.dat"), b"x").unwrap();
+
+        let out = scan_worlds(&dir, "world");
+        assert_eq!(out.len(), 1);
+        assert!(out[0].is_current);
+        assert!(out[0].has_level_dat);
+    }
+
+    #[test]
+    fn parse_hh_mm_accepts_valid_times() {
+        assert_eq!(parse_hh_mm("00:00"), Some((0, 0)));
+        assert_eq!(parse_hh_mm("23:59"), Some((23, 59)));
+        assert_eq!(parse_hh_mm("4:5"), Some((4, 5)));
+        assert!(parse_hh_mm("24:00").is_none());
+        assert!(parse_hh_mm("12:60").is_none());
+        assert!(parse_hh_mm("nope").is_none());
+        assert!(parse_hh_mm("12").is_none());
+    }
+
+    #[test]
+    fn tmux_session_name_stable_and_safe() {
+        // Same dir → same name (so start_server and stop_server agree).
+        assert_eq!(
+            tmux_session_name(Path::new("/mnt/data/mc-server")),
+            tmux_session_name(Path::new("/mnt/data/mc-server"))
+        );
+        // No characters tmux would choke on.
+        let n = tmux_session_name(Path::new("/srv/MyServer 2024!"));
+        for c in n.chars() {
+            assert!(c.is_ascii_alphanumeric() || c == '-', "bad char {:?} in {}", c, n);
+        }
+        assert!(n.starts_with("mc-tui-"));
+    }
+
+    #[test]
+    fn server_dir_slug_sanitizes() {
+        assert_eq!(server_dir_slug(Path::new("/mnt/data/mc-server")), "mc-server");
+        assert_eq!(server_dir_slug(Path::new("/srv/MyServer 2024")), "myserver-2024");
+        assert_eq!(server_dir_slug(Path::new("/")), "server");
+    }
+
+    #[test]
+    fn fmt_age_basic() {
+        use chrono::Duration as D;
+        assert!(fmt_age(D::seconds(30)).contains("s ago"));
+        assert!(fmt_age(D::seconds(120)).contains("m ago"));
+        assert!(fmt_age(D::seconds(3600 * 5)).contains("h ago"));
+        assert!(fmt_age(D::seconds(86400 * 3)).contains("d ago"));
+        assert!(fmt_age(D::seconds(86400 * 90)).contains("mo ago"));
+    }
+
+    #[test]
+    fn server_action_labels_exist_in_both_langs() {
+        for action in SERVER_ACTIONS.iter().copied() {
+            let en = server_action_label(Lang::En, action);
+            let zh = server_action_label(Lang::Zh, action);
+            assert!(!en.is_empty());
+            assert!(!zh.is_empty());
+        }
     }
 
     #[test]
