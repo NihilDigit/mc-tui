@@ -276,8 +276,9 @@ fn read_whitelist(server_dir: &Path) -> Result<Vec<WhitelistEntry>> {
     if !path.exists() {
         return Ok(Vec::new());
     }
-    let raw = fs::read_to_string(&path)?;
-    Ok(serde_json::from_str(&raw).unwrap_or_default())
+    let raw = fs::read_to_string(&path)
+        .with_context(|| format!("read {}", path.display()))?;
+    serde_json::from_str(&raw).with_context(|| format!("parse {}", path.display()))
 }
 
 fn write_whitelist(server_dir: &Path, entries: &[WhitelistEntry]) -> Result<()> {
@@ -292,8 +293,9 @@ fn read_ops(server_dir: &Path) -> Result<Vec<OpEntry>> {
     if !path.exists() {
         return Ok(Vec::new());
     }
-    let raw = fs::read_to_string(&path)?;
-    Ok(serde_json::from_str(&raw).unwrap_or_default())
+    let raw = fs::read_to_string(&path)
+        .with_context(|| format!("read {}", path.display()))?;
+    serde_json::from_str(&raw).with_context(|| format!("parse {}", path.display()))
 }
 
 fn write_ops(server_dir: &Path, entries: &[OpEntry]) -> Result<()> {
@@ -1335,6 +1337,12 @@ struct App {
     worlds: Vec<WorldEntry>,
     whitelist: Vec<WhitelistEntry>,
     ops: Vec<OpEntry>,
+    /// True if the on-disk whitelist.json failed to parse last refresh.
+    /// While set, mc-tui refuses to write to whitelist.json (would clobber the
+    /// real, hand-edited file with our empty in-memory copy).
+    whitelist_corrupt: bool,
+    /// Same idea for ops.json.
+    ops_corrupt: bool,
     pid: Option<u32>,
 
     tab: TabId,
@@ -1392,6 +1400,8 @@ impl App {
             worlds: Vec::new(),
             whitelist: Vec::new(),
             ops: Vec::new(),
+            whitelist_corrupt: false,
+            ops_corrupt: false,
             pid: None,
             tab: TabId::Worlds,
             worlds_state: ListState::default(),
@@ -1449,8 +1459,34 @@ impl App {
     fn refresh_all(&mut self) {
         let cur = self.current_level().to_string();
         self.worlds = scan_worlds(&self.server_dir, &cur);
-        self.whitelist = read_whitelist(&self.server_dir).unwrap_or_default();
-        self.ops = read_ops(&self.server_dir).unwrap_or_default();
+        match read_whitelist(&self.server_dir) {
+            Ok(v) => {
+                self.whitelist = v;
+                self.whitelist_corrupt = false;
+            }
+            Err(e) => {
+                self.whitelist = Vec::new();
+                self.whitelist_corrupt = true;
+                self.status = match self.lang {
+                    Lang::En => format!("✗ whitelist.json unreadable: {} (writes blocked)", e),
+                    Lang::Zh => format!("✗ whitelist.json 无法解析：{}（写入已封锁）", e),
+                };
+            }
+        }
+        match read_ops(&self.server_dir) {
+            Ok(v) => {
+                self.ops = v;
+                self.ops_corrupt = false;
+            }
+            Err(e) => {
+                self.ops = Vec::new();
+                self.ops_corrupt = true;
+                self.status = match self.lang {
+                    Lang::En => format!("✗ ops.json unreadable: {} (writes blocked)", e),
+                    Lang::Zh => format!("✗ ops.json 无法解析：{}（写入已封锁）", e),
+                };
+            }
+        }
         self.pid = server_running_pid(&self.server_dir, self.pid);
         self.yaml_files = list_yaml_files(&self.server_dir);
         self.backups = scan_backups(&self.server_dir);
@@ -1533,6 +1569,13 @@ impl App {
     }
 
     fn add_whitelist(&mut self, name: &str) -> Result<()> {
+        if self.whitelist_corrupt {
+            self.status = match self.lang {
+                Lang::En => "✗ whitelist.json is corrupt — fix it before editing.".into(),
+                Lang::Zh => "✗ whitelist.json 损坏，请先修复后再编辑。".into(),
+            };
+            return Ok(());
+        }
         let name = name.trim();
         if name.is_empty() {
             return Ok(());
@@ -1552,6 +1595,13 @@ impl App {
     }
 
     fn remove_whitelist(&mut self) -> Result<()> {
+        if self.whitelist_corrupt {
+            self.status = match self.lang {
+                Lang::En => "✗ whitelist.json is corrupt — fix it before editing.".into(),
+                Lang::Zh => "✗ whitelist.json 损坏，请先修复后再编辑。".into(),
+            };
+            return Ok(());
+        }
         let Some(idx) = self.whitelist_state.selected() else { return Ok(()) };
         if idx >= self.whitelist.len() {
             return Ok(());
@@ -1568,6 +1618,13 @@ impl App {
     }
 
     fn add_op(&mut self, name: &str) -> Result<()> {
+        if self.ops_corrupt {
+            self.status = match self.lang {
+                Lang::En => "✗ ops.json is corrupt — fix it before editing.".into(),
+                Lang::Zh => "✗ ops.json 损坏，请先修复后再编辑。".into(),
+            };
+            return Ok(());
+        }
         let name = name.trim();
         if name.is_empty() {
             return Ok(());
@@ -1589,6 +1646,13 @@ impl App {
     }
 
     fn remove_op(&mut self) -> Result<()> {
+        if self.ops_corrupt {
+            self.status = match self.lang {
+                Lang::En => "✗ ops.json is corrupt — fix it before editing.".into(),
+                Lang::Zh => "✗ ops.json 损坏，请先修复后再编辑。".into(),
+            };
+            return Ok(());
+        }
         let Some(idx) = self.ops_state.selected() else { return Ok(()) };
         if idx >= self.ops.len() {
             return Ok(());
@@ -1605,12 +1669,21 @@ impl App {
     }
 
     fn cycle_op_level(&mut self, dir: i8) -> Result<()> {
+        if self.ops_corrupt {
+            self.status = match self.lang {
+                Lang::En => "✗ ops.json is corrupt — fix it before editing.".into(),
+                Lang::Zh => "✗ ops.json 损坏，请先修复后再编辑。".into(),
+            };
+            return Ok(());
+        }
         let Some(idx) = self.ops_state.selected() else { return Ok(()) };
         if idx >= self.ops.len() {
             return Ok(());
         }
+        // Wrap-around 1..=4 (CLAUDE.md says "Level cycles 1–4"): ←/→ at the edges
+        // jumps back to the other end instead of clamping.
         let cur = self.ops[idx].level as i16;
-        let new = (cur + dir as i16).clamp(1, 4) as u8;
+        let new = ((cur - 1 + dir as i16).rem_euclid(4) + 1) as u8;
         self.ops[idx].level = new;
         write_ops(&self.server_dir, &self.ops)?;
         let name = self.ops[idx].name.clone();
@@ -1977,7 +2050,9 @@ impl App {
                 };
                 return Ok(());
             }
-            let cmd_str = format!("bash {}", script.display());
+            // tmux passes the command string to `/bin/sh -c`; quote the path
+            // so spaces, quotes, $, ` etc. in server-dir don't break the launch.
+            let cmd_str = format!("bash {}", shell_quote_sh(&script.display().to_string()));
             let res = Command::new("tmux")
                 .arg("new-session")
                 .arg("-d")
@@ -2157,6 +2232,24 @@ impl App {
         };
         self.server_dir = canonical;
         self.properties = read_properties(&self.server_dir.join("server.properties"))?;
+
+        // Drop YAML editor state — yaml_root / yaml_rows belong to the OLD dir
+        // and yaml_save_current would otherwise dump them into the NEW dir's
+        // config files, corrupting them.
+        self.yaml_view = YamlView::Files;
+        self.yaml_root = None;
+        self.yaml_rows.clear();
+        self.yaml_rows_state = ListState::default();
+        self.yaml_files_state = ListState::default();
+
+        // RCON history is per-server; clear it.
+        self.rcon_history.clear();
+        self.rcon_state = ListState::default();
+
+        self.backups_state = ListState::default();
+        self.server_state = ListState::default();
+        self.server_state.select(Some(0));
+
         self.refresh_all();
 
         self.worlds_state = ListState::default();
@@ -2174,6 +2267,12 @@ impl App {
         self.config_state = ListState::default();
         if !self.properties.is_empty() {
             self.config_state.select(Some(0));
+        }
+        if !self.yaml_files.is_empty() {
+            self.yaml_files_state.select(Some(0));
+        }
+        if !self.backups.is_empty() {
+            self.backups_state.select(Some(0));
         }
 
         let mut state = read_persisted_state();
@@ -2200,6 +2299,33 @@ fn parse_hh_mm(s: &str) -> Option<(u8, u8)> {
 /// Same dir → same session every time, so `start` / `stop` find the same place.
 fn tmux_session_name(server_dir: &Path) -> String {
     format!("mc-tui-{}", server_dir_slug(server_dir))
+}
+
+/// POSIX-shell-safe single-quote of `s`. tmux `new-session [shell-command]`
+/// passes its command string to `/bin/sh -c`, so any path containing whitespace,
+/// quotes, `$`, backticks, etc. would otherwise break.
+fn shell_quote_sh(s: &str) -> String {
+    // `'` inside a single-quoted string is closed with `'`, escaped as `\'`,
+    // then re-opened with `'`. Empty input → `''`.
+    if s.is_empty() {
+        return "''".to_string();
+    }
+    let safe = s
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '.' | '_' | '-' | ':' | ','));
+    if safe {
+        return s.to_string();
+    }
+    let mut out = String::from("'");
+    for c in s.chars() {
+        if c == '\'' {
+            out.push_str(r"'\''");
+        } else {
+            out.push(c);
+        }
+    }
+    out.push('\'');
+    out
 }
 
 fn tmux_session_alive(name: &str) -> bool {
@@ -4790,6 +4916,58 @@ Java(TM) SE Runtime Environment ..."#;
         assert!(parse_hh_mm("12:60").is_none());
         assert!(parse_hh_mm("nope").is_none());
         assert!(parse_hh_mm("12").is_none());
+    }
+
+    #[test]
+    fn op_level_cycles_at_edges() {
+        // 1 ← wraps to 4
+        assert_eq!(((1i16 - 1 + -1).rem_euclid(4) + 1) as u8, 4);
+        // 4 → wraps to 1
+        assert_eq!(((4i16 - 1 + 1).rem_euclid(4) + 1) as u8, 1);
+        // mid-range
+        assert_eq!(((2i16 - 1 + 1).rem_euclid(4) + 1) as u8, 3);
+        assert_eq!(((3i16 - 1 + -1).rem_euclid(4) + 1) as u8, 2);
+    }
+
+    #[test]
+    fn shell_quote_sh_handles_dangerous_characters() {
+        // safe → unquoted
+        assert_eq!(shell_quote_sh("/srv/mc-server/start.sh"), "/srv/mc-server/start.sh");
+        assert_eq!(shell_quote_sh("plain"), "plain");
+        // spaces → single-quoted
+        assert_eq!(shell_quote_sh("/srv/My Server/start.sh"), "'/srv/My Server/start.sh'");
+        // single quote inside → '\'' escape sequence
+        assert_eq!(shell_quote_sh("a'b"), r"'a'\''b'");
+        // empty
+        assert_eq!(shell_quote_sh(""), "''");
+        // dollar / backtick / double-quote all force quoting
+        assert!(shell_quote_sh("$HOME").starts_with('\''));
+        assert!(shell_quote_sh("`x`").starts_with('\''));
+        assert!(shell_quote_sh("a\"b").starts_with('\''));
+    }
+
+    #[test]
+    fn read_whitelist_propagates_parse_error() {
+        let dir = tempdir();
+        fs::write(dir.join("whitelist.json"), b"{ not json").unwrap();
+        let res = read_whitelist(&dir);
+        assert!(res.is_err(), "expected parse error to propagate");
+    }
+
+    #[test]
+    fn read_ops_propagates_parse_error() {
+        let dir = tempdir();
+        fs::write(dir.join("ops.json"), b"garbage").unwrap();
+        let res = read_ops(&dir);
+        assert!(res.is_err(), "expected parse error to propagate");
+    }
+
+    #[test]
+    fn read_whitelist_missing_file_returns_empty() {
+        let dir = tempdir();
+        // no whitelist.json at all — fresh server-dir
+        let v = read_whitelist(&dir).unwrap();
+        assert!(v.is_empty());
     }
 
     #[test]
