@@ -1,7 +1,7 @@
 # shulker
 
 [![Test](https://github.com/NihilDigit/shulker/actions/workflows/test.yml/badge.svg)](https://github.com/NihilDigit/shulker/actions/workflows/test.yml)
-[![Release](https://img.shields.io/github/v/release/NihilDigit/shulker?display_name=tag&sort=semver)](https://github.com/NihilDigit/shulker/releases/latest)
+[![Release](https://img.shields.io/github/v/release/NihilDigit/shulker?display_name=tag)](https://github.com/NihilDigit/shulker/releases/latest)
 [![License](https://img.shields.io/github/license/NihilDigit/shulker)](LICENSE)
 
 A small TUI (terminal UI) manager for a local Minecraft Paper / Purpur server.
