@@ -13,8 +13,8 @@ use ratatui::{
 };
 
 use crate::data::{
-    detect_interfaces, fmt_bytes, get_property, nic_kind_color, nic_kind_label, NicInfo, NicKind,
-    YamlDisplay,
+    detect_interfaces, fmt_bytes, get_property, nic_kind_color, nic_kind_label, DockerState,
+    NicInfo, NicKind, YamlDisplay,
 };
 use crate::i18n::{
     fmt_log_read_error, fmt_status_running, hint_for, property_metadata, property_zh,
@@ -129,7 +129,7 @@ fn draw_header_line(f: &mut Frame, area: Rect, app: &mut App) {
     } else {
         spans.push(Span::styled(
             match app.lang {
-                Lang::En => "(no LAN/Public/ZeroTier IPv4)",
+                Lang::En => "(no LAN/Public IPv4)",
                 Lang::Zh => "(无可用 IPv4)",
             },
             Style::default().fg(Color::DarkGray),
@@ -679,10 +679,19 @@ fn draw_join_info(f: &mut Frame, area: Rect, app: &mut App, nics: &[NicInfo]) {
     };
 
     // Optional SakuraFrp row. The user-set address is the literal string they
-    // need to share — already includes port (e.g. `cn-sh.frp.one:23456`)
-    // because frp tunnels remap the local 25565 to whatever port the provider
-    // assigned, not server.properties' server-port. Click → wl-copy.
+    // need to share — already includes port (e.g. `frp-way.com:36192`) because
+    // frp tunnels remap the local 25565 to whatever port the provider
+    // assigned, not server.properties' server-port. Click → wl-copy. The
+    // bracketed kind label also embeds a Docker state marker (●/○/✗/?) so the
+    // user can see at a glance whether the launcher container is up.
     if let Some(addr) = app.sakurafrp_address.clone() {
+        let (state_marker, state_color) = match app.sakurafrp_docker.state {
+            DockerState::Running => ("●", Color::Green),
+            DockerState::Stopped => ("○", Color::Yellow),
+            DockerState::Missing => ("✗", Color::Red),
+            DockerState::Unknown => ("?", Color::DarkGray),
+        };
+
         let name_span = Span::styled(
             format!("{:14}", "frp"),
             Style::default().fg(Color::White),
@@ -694,10 +703,10 @@ fn draw_join_info(f: &mut Frame, area: Rect, app: &mut App, nics: &[NicInfo]) {
                 .fg(Color::Magenta)
                 .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
         );
-        let kind_span = Span::styled(
-            format!("[{}]", s.frp_label),
-            Style::default().fg(Color::Magenta),
-        );
+        let kind_open = Span::styled("[", Style::default().fg(Color::Magenta));
+        let kind_label = Span::styled(s.frp_label, Style::default().fg(Color::Magenta));
+        let kind_marker = Span::styled(format!(" {}", state_marker), Style::default().fg(state_color));
+        let kind_close = Span::styled("]", Style::default().fg(Color::Magenta));
 
         // Compute chip rect for click-to-copy. Account for the block's 1-char
         // top border and the leading space + name column.
@@ -721,7 +730,10 @@ fn draw_join_info(f: &mut Frame, area: Rect, app: &mut App, nics: &[NicInfo]) {
             Span::raw("  "),
             addr_span,
             Span::raw("  "),
-            kind_span,
+            kind_open,
+            kind_label,
+            kind_marker,
+            kind_close,
         ]));
     }
 

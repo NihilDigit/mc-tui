@@ -31,12 +31,13 @@ pub fn state_path() -> PathBuf {
 pub struct PersistedState {
     pub server_dir: Option<PathBuf>,
     pub lang: Option<String>,
-    /// SakuraFrp tunnel public address (e.g. `cn-sh.frp.one:23456`). User-set
-    /// via the Server tab prompt; rendered in join-info, click-to-copy. mc-tui
-    /// does not manage the frpc service itself — that's the SakuraFrp client's
-    /// job. We just surface the address so it lives next to the LAN/ZeroTier
-    /// IPs the user shares with friends.
+    /// SakuraFrp tunnel public address (e.g. `frp-way.com:36192`). User-set
+    /// via the Server tab prompt; rendered in join-info, click-to-copy.
     pub sakurafrp_address: Option<String>,
+    /// SakuraFrp launcher Docker container name. Defaults to `natfrp-service`
+    /// (matches the official launcher image's typical name). Used by Server
+    /// tab actions that probe / start / stop / restart the container.
+    pub sakurafrp_container: Option<String>,
 }
 
 pub fn read_persisted_state() -> PersistedState {
@@ -57,6 +58,7 @@ pub fn read_persisted_state() -> PersistedState {
                 "server_dir" => state.server_dir = Some(PathBuf::from(v)),
                 "lang" => state.lang = Some(v),
                 "sakurafrp_address" => state.sakurafrp_address = Some(v),
+                "sakurafrp_container" => state.sakurafrp_container = Some(v),
                 _ => {}
             }
         }
@@ -78,6 +80,9 @@ pub fn write_persisted_state(state: &PersistedState) -> Result<()> {
     }
     if let Some(addr) = &state.sakurafrp_address {
         s.push_str(&format!("sakurafrp_address = \"{}\"\n", addr));
+    }
+    if let Some(c) = &state.sakurafrp_container {
+        s.push_str(&format!("sakurafrp_container = \"{}\"\n", c));
     }
     fs::write(&path, s).with_context(|| format!("write {}", path.display()))?;
     Ok(())

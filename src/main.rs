@@ -77,10 +77,15 @@ enum ServerAction {
     PreGenChunks,
     OpenSystemdStatus,
     ShowAttachCommand,
-    // v0.8 — surface the SakuraFrp tunnel address in the join-bar. mc-tui
-    // doesn't manage frpc itself (the SakuraFrp client does that); we just
-    // show the host:port the user shares with friends.
+    // v0.8 — surface the SakuraFrp tunnel address in the join-bar.
     SetSakuraFrpAddress,
+    // v0.9 — manage the SakuraFrp launcher Docker container directly.
+    // Container name persisted in state.toml (default `natfrp-service`).
+    SetSakuraFrpContainer,
+    SakuraFrpStart,
+    SakuraFrpStop,
+    SakuraFrpRestart,
+    SakuraFrpShowLogs,
 }
 
 const SERVER_ACTIONS: &[ServerAction] = &[
@@ -92,7 +97,18 @@ const SERVER_ACTIONS: &[ServerAction] = &[
     ServerAction::PreGenChunks,
     ServerAction::OpenSystemdStatus,
     ServerAction::SetSakuraFrpAddress,
+    ServerAction::SakuraFrpStart,
+    ServerAction::SakuraFrpStop,
+    ServerAction::SakuraFrpRestart,
+    ServerAction::SakuraFrpShowLogs,
+    ServerAction::SetSakuraFrpContainer,
 ];
+
+/// Default Docker container name for the SakuraFrp launcher image. The user
+/// can override it in state.toml or via the Server tab prompt; this is what
+/// the official launcher install ends up named when run with `docker run …
+/// --name natfrp-service natfrp.com/launcher`.
+const DEFAULT_SAKURAFRP_CONTAINER: &str = "natfrp-service";
 
 /// YAML tab toggles between file picker and a flat row editor for one file.
 #[derive(Debug, Clone)]
@@ -121,6 +137,7 @@ enum PromptAction {
     ScheduleDailyBackup,
     PreGenChunkRadius,
     SetSakuraFrpAddress,
+    SetSakuraFrpContainer,
 }
 
 struct App {
@@ -161,6 +178,10 @@ struct App {
     // v0.8 — SakuraFrp tunnel public address (display-only). Persisted in
     // state.toml. The actual frpc service is managed by the SakuraFrp client.
     pub sakurafrp_address: Option<String>,
+    // v0.9 — Docker container name for the SakuraFrp launcher + cached
+    // last-probed state.
+    pub sakurafrp_container: String,
+    pub sakurafrp_docker: SakuraFrpDocker,
 
     pub status: String,
     pub prompt: Option<InputPrompt>,
@@ -208,6 +229,10 @@ impl App {
             // Pull persisted SakuraFrp address so the join-bar shows the
             // public entry from the start of the session.
             sakurafrp_address: read_persisted_state().sakurafrp_address,
+            sakurafrp_container: read_persisted_state()
+                .sakurafrp_container
+                .unwrap_or_else(|| DEFAULT_SAKURAFRP_CONTAINER.to_string()),
+            sakurafrp_docker: SakuraFrpDocker::default(),
             status: match lang {
                 Lang::En => String::from("Ready."),
                 Lang::Zh => String::from("就绪。"),
@@ -279,6 +304,7 @@ impl App {
         self.pid = server_running_pid(&self.server_dir, self.pid);
         self.yaml_files = list_yaml_files(&self.server_dir);
         self.backups = scan_backups(&self.server_dir);
+        self.sakurafrp_docker = detect_sakurafrp_docker(&self.sakurafrp_container);
     }
 
     fn list_state_for(&mut self, tab: TabId) -> &mut ListState {
@@ -775,6 +801,70 @@ impl App {
         Ok(())
     }
 
+    fn set_sakurafrp_container(&mut self, value: &str) -> Result<()> {
+        let trimmed = value.trim();
+        let mut state = read_persisted_state();
+        if trimmed.is_empty() {
+            // Empty input = reset to default rather than clear (we always
+            // need *something* to probe; default is the canonical install).
+            self.sakurafrp_container = DEFAULT_SAKURAFRP_CONTAINER.to_string();
+            state.sakurafrp_container = None;
+            self.status = match self.lang {
+                Lang::En => format!("✓ Reset SakuraFrp container to {}.", DEFAULT_SAKURAFRP_CONTAINER),
+                Lang::Zh => format!("✓ SakuraFrp 容器名重置为 {}。", DEFAULT_SAKURAFRP_CONTAINER),
+            };
+        } else {
+            self.sakurafrp_container = trimmed.to_string();
+            state.sakurafrp_container = Some(trimmed.to_string());
+            self.status = match self.lang {
+                Lang::En => format!("✓ SakuraFrp container set: {}", trimmed),
+                Lang::Zh => format!("✓ SakuraFrp 容器名已保存：{}", trimmed),
+            };
+        }
+        let _ = write_persisted_state(&state);
+        // Re-probe immediately so the join-bar marker updates.
+        self.sakurafrp_docker = detect_sakurafrp_docker(&self.sakurafrp_container);
+        Ok(())
+    }
+
+    fn run_frp_lifecycle(&mut self, verb: &str) {
+        let container = self.sakurafrp_container.clone();
+        match docker_lifecycle(verb, &container) {
+            Ok(_) => {
+                self.status = match self.lang {
+                    Lang::En => format!("✓ docker {} {}", verb, container),
+                    Lang::Zh => format!("✓ docker {} {} 完成", verb, container),
+                };
+            }
+            Err(e) => {
+                self.status = match self.lang {
+                    Lang::En => format!("✗ docker {} failed: {}", verb, e),
+                    Lang::Zh => format!("✗ docker {} 失败：{}", verb, e),
+                };
+            }
+        }
+        // Re-probe so the marker reflects the new state.
+        self.sakurafrp_docker = detect_sakurafrp_docker(&self.sakurafrp_container);
+    }
+
+    fn show_frp_logs_command(&mut self) {
+        let cmd = format!("docker logs -f --tail 50 {}", self.sakurafrp_container);
+        let copied = std::process::Command::new("wl-copy")
+            .arg(&cmd)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|st| st.success())
+            .unwrap_or(false);
+        self.status = match (self.lang, copied) {
+            (Lang::En, true) => format!("ℹ Copied to clipboard: {}", cmd),
+            (Lang::En, false) => format!("ℹ {} (wl-copy unavailable)", cmd),
+            (Lang::Zh, true) => format!("ℹ 已复制到剪贴板：{}", cmd),
+            (Lang::Zh, false) => format!("ℹ {}（wl-copy 不可用）", cmd),
+        };
+    }
+
     fn show_systemd_status(&mut self) {
         let unit_dir = config_dir().parent().unwrap_or(Path::new(".")).join("systemd").join("user");
         self.status = match self.lang {
@@ -1117,6 +1207,7 @@ fn run<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<()> {
                         }
                         PromptAction::PreGenChunkRadius => app.pregen_chunks(&value)?,
                         PromptAction::SetSakuraFrpAddress => app.set_sakurafrp_address(&value)?,
+                        PromptAction::SetSakuraFrpContainer => app.set_sakurafrp_container(&value)?,
                     }
                 }
                 KeyCode::Backspace => {
@@ -1332,6 +1423,31 @@ fn handle_server_action(app: &mut App, a: ServerAction) -> Result<()> {
                 buffer: app.sakurafrp_address.clone().unwrap_or_default(),
                 action: PromptAction::SetSakuraFrpAddress,
             });
+            Ok(())
+        }
+        ServerAction::SetSakuraFrpContainer => {
+            app.prompt = Some(InputPrompt {
+                title: s.frp_prompt_container_title.into(),
+                label: s.frp_prompt_container_label.into(),
+                buffer: app.sakurafrp_container.clone(),
+                action: PromptAction::SetSakuraFrpContainer,
+            });
+            Ok(())
+        }
+        ServerAction::SakuraFrpStart => {
+            app.run_frp_lifecycle("start");
+            Ok(())
+        }
+        ServerAction::SakuraFrpStop => {
+            app.run_frp_lifecycle("stop");
+            Ok(())
+        }
+        ServerAction::SakuraFrpRestart => {
+            app.run_frp_lifecycle("restart");
+            Ok(())
+        }
+        ServerAction::SakuraFrpShowLogs => {
+            app.show_frp_logs_command();
             Ok(())
         }
     }
@@ -1891,14 +2007,14 @@ mod tests {
     #[test]
     fn classify_iface_handles_known_naming_conventions() {
         use std::net::Ipv4Addr;
-        // ZeroTier — name prefix wins regardless of IP range
+        // ZeroTier name prefix is now folded into Tun (mesh-VPN-ish virtual iface)
         assert_eq!(
             classify_iface("ztpp6kuvag", &Ipv4Addr::new(10, 24, 0, 11)),
-            NicKind::Zerotier
+            NicKind::Tun
         );
         assert_eq!(
             classify_iface("zerotier0", &Ipv4Addr::new(192, 168, 1, 5)),
-            NicKind::Zerotier
+            NicKind::Tun
         );
         // Loopback — IP wins
         assert_eq!(
@@ -1944,17 +2060,31 @@ mod tests {
     }
 
     #[test]
-    fn nic_kind_priority_orders_zerotier_first() {
-        assert!(nic_kind_priority(NicKind::Zerotier) < nic_kind_priority(NicKind::Lan));
+    fn parse_docker_state_maps_status_strings() {
+        // `running` is the only "live" state we care about; everything else is
+        // some flavour of "not running".
+        assert_eq!(parse_docker_state("running"), DockerState::Running);
+        for s in ["created", "exited", "paused", "restarting", "dead", "removing"] {
+            assert_eq!(parse_docker_state(s), DockerState::Stopped, "{}", s);
+        }
+        // Empty / weird → unknown so we don't lie about the launcher's state.
+        assert_eq!(parse_docker_state(""), DockerState::Unknown);
+        // Whitespace-trimmed (docker inspect output has trailing newline).
+        assert_eq!(parse_docker_state("running\n"), DockerState::Running);
+        assert_eq!(parse_docker_state("  running  "), DockerState::Running);
+    }
+
+    #[test]
+    fn nic_kind_priority_orders_lan_first() {
         assert!(nic_kind_priority(NicKind::Lan) < nic_kind_priority(NicKind::Public));
         assert!(nic_kind_priority(NicKind::Public) < nic_kind_priority(NicKind::Tun));
+        assert!(nic_kind_priority(NicKind::Tun) < nic_kind_priority(NicKind::Docker));
         assert!(nic_kind_priority(NicKind::Docker) < nic_kind_priority(NicKind::Loopback));
     }
 
     #[test]
     fn nic_kind_label_localized() {
         for k in [
-            NicKind::Zerotier,
             NicKind::Lan,
             NicKind::Public,
             NicKind::Tun,

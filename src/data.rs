@@ -296,7 +296,6 @@ pub fn server_running_pid(server_dir: &Path, prev: Option<u32>) -> Option<u32> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NicKind {
     Loopback,
-    Zerotier,
     Lan,
     Public,
     Tun,
@@ -311,16 +310,13 @@ pub struct NicInfo {
 }
 
 /// Heuristic classifier. Prefers interface naming convention over IP-range
-/// guessing (since CGNAT can give 10.x to a Wi-Fi card and ZT can route
-/// non-private ranges). IP range only decides Lan vs Public.
+/// guessing (since CGNAT can give 10.x to a Wi-Fi card and a tun device can
+/// route non-private ranges). IP range only decides Lan vs Public.
 pub fn classify_iface(name: &str, ip: &std::net::Ipv4Addr) -> NicKind {
     if ip.is_loopback() {
         return NicKind::Loopback;
     }
     let lower = name.to_ascii_lowercase();
-    if lower.starts_with("zt") || lower.starts_with("zerotier") {
-        return NicKind::Zerotier;
-    }
     if lower.starts_with("docker") || lower.starts_with("br-") || lower.starts_with("veth") {
         return NicKind::Docker;
     }
@@ -328,6 +324,8 @@ pub fn classify_iface(name: &str, ip: &std::net::Ipv4Addr) -> NicKind {
         || lower.starts_with("tap")
         || lower.starts_with("wg")
         || lower.starts_with("tailscale")
+        || lower.starts_with("zt")
+        || lower.starts_with("zerotier")
         || lower == "mihomo"
         || lower == "utun"
     {
@@ -346,27 +344,24 @@ pub fn classify_iface(name: &str, ip: &std::net::Ipv4Addr) -> NicKind {
 }
 
 /// Sort key — lower = shown first. Friend-group-server priority:
-/// ZeroTier first (this is what we tell friends), then LAN, then Public.
+/// LAN first (most common case), then Public, then virtual interfaces.
 pub fn nic_kind_priority(k: NicKind) -> u8 {
     match k {
-        NicKind::Zerotier => 0,
-        NicKind::Lan => 1,
-        NicKind::Public => 2,
-        NicKind::Tun => 3,
-        NicKind::Docker => 4,
-        NicKind::Loopback => 5,
+        NicKind::Lan => 0,
+        NicKind::Public => 1,
+        NicKind::Tun => 2,
+        NicKind::Docker => 3,
+        NicKind::Loopback => 4,
     }
 }
 
 pub fn nic_kind_label(lang: Lang, k: NicKind) -> &'static str {
     match (lang, k) {
-        (Lang::En, NicKind::Zerotier) => "ZeroTier",
         (Lang::En, NicKind::Lan) => "LAN",
         (Lang::En, NicKind::Public) => "Public",
         (Lang::En, NicKind::Tun) => "VPN/TUN",
         (Lang::En, NicKind::Docker) => "Docker",
         (Lang::En, NicKind::Loopback) => "Loopback",
-        (Lang::Zh, NicKind::Zerotier) => "ZeroTier",
         (Lang::Zh, NicKind::Lan) => "局域网",
         (Lang::Zh, NicKind::Public) => "公网",
         (Lang::Zh, NicKind::Tun) => "VPN/TUN",
@@ -377,7 +372,6 @@ pub fn nic_kind_label(lang: Lang, k: NicKind) -> &'static str {
 
 pub fn nic_kind_color(k: NicKind) -> Color {
     match k {
-        NicKind::Zerotier => Color::Magenta,
         NicKind::Lan => Color::Green,
         NicKind::Public => Color::Yellow,
         NicKind::Tun => Color::Cyan,
@@ -413,6 +407,81 @@ pub fn detect_interfaces() -> Vec<NicInfo> {
     }
     result.sort_by_key(|n| (nic_kind_priority(n.kind), n.name.clone()));
     result
+}
+
+// ---------- SakuraFrp launcher Docker probe ----------
+//
+// SakuraFrp's official launcher ships as a Docker container that runs frpc
+// inside. mc-tui shows whether that container is running and offers
+// start / stop / restart actions — the actual frpc + tunnel config lives in
+// the SakuraFrp web console (https://www.natfrp.com), we don't replicate that.
+//
+// All commands shell out to `docker` (no sudo); status messages bubble up to
+// the App.status hint line. Probing on every refresh adds a single ~80ms
+// `docker inspect` call which is acceptable for a TUI refreshed on key events.
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DockerState {
+    Running,
+    /// Container exists but is not running (created/exited/paused/dead/restarting).
+    Stopped,
+    /// Container does not exist on this host.
+    Missing,
+    /// `docker` binary not found, or daemon unreachable.
+    #[default]
+    Unknown,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct SakuraFrpDocker {
+    pub state: DockerState,
+}
+
+pub fn detect_sakurafrp_docker(container: &str) -> SakuraFrpDocker {
+    use std::process::Command;
+    let out = Command::new("docker")
+        .args(["inspect", "--format", "{{.State.Status}}", container])
+        .output();
+    let Ok(out) = out else {
+        return SakuraFrpDocker { state: DockerState::Unknown };
+    };
+    if !out.status.success() {
+        // `docker inspect` prints "No such object" to stderr and exits 1
+        // when the container doesn't exist.
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        if stderr.contains("No such object") || stderr.contains("not found") {
+            return SakuraFrpDocker { state: DockerState::Missing };
+        }
+        return SakuraFrpDocker { state: DockerState::Unknown };
+    }
+    let status = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    SakuraFrpDocker { state: parse_docker_state(&status) }
+}
+
+/// Map `docker inspect`'s `.State.Status` string to our enum. Pure, testable.
+pub fn parse_docker_state(s: &str) -> DockerState {
+    match s.trim() {
+        "running" => DockerState::Running,
+        "" => DockerState::Unknown,
+        // created / exited / paused / restarting / dead / removing — all "not running"
+        _ => DockerState::Stopped,
+    }
+}
+
+/// Run `docker <verb> <container>` synchronously and return stdout/stderr in a
+/// single Result so the caller can feed it straight to App.status.
+pub fn docker_lifecycle(verb: &str, container: &str) -> Result<String> {
+    use std::process::Command;
+    let out = Command::new("docker")
+        .args([verb, container])
+        .output()
+        .with_context(|| format!("spawn docker {}", verb))?;
+    if out.status.success() {
+        Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+    } else {
+        let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        anyhow::bail!("docker {} {}: {}", verb, container, err)
+    }
 }
 
 // ---------- v0.5: backup scanner ----------
