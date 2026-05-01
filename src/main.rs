@@ -1,9 +1,11 @@
-//! mc-tui — a TUI manager for a local Minecraft Paper/Purpur server.
+//! shulker — a TUI manager for a local Minecraft Paper/Purpur server.
 
 mod cli;
+mod console;
 mod data;
 mod i18n;
 mod natfrp;
+mod scheduler;
 mod sys;
 mod ui;
 use cli::*;
@@ -30,16 +32,12 @@ use crossterm::{
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
-use md5::{Digest, Md5};
 use ratatui::{
-    layout::{Constraint, Direction, Layout, Rect},
+    layout::Rect,
     prelude::*,
-    style::{Color, Modifier, Style},
-    text::{Line, Span},
-    widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Tabs, Wrap},
+    widgets::ListState,
     Terminal,
 };
-use serde::{Deserialize, Serialize};
 
 
 // (i18n / data / sys / cli moved to their own files — see mod declarations above.)
@@ -199,12 +197,6 @@ pub fn classify_status(msg: &str) -> ToastKind {
     }
 }
 
-/// Default Docker container name for the SakuraFrp launcher image. The user
-/// can override it in state.toml or via the Server tab prompt; this is what
-/// the official launcher install ends up named when run with `docker run …
-/// --name natfrp-service natfrp.com/launcher`.
-const DEFAULT_SAKURAFRP_CONTAINER: &str = "natfrp-service";
-
 /// Settings tab view (v0.16 — formerly the YAML tab's `YamlView`, extended to
 /// also cover `server.properties` editing now that Settings absorbed the old
 /// Config tab). Three states:
@@ -337,7 +329,7 @@ struct App {
     pub whitelist: Vec<WhitelistEntry>,
     pub ops: Vec<OpEntry>,
     /// True if the on-disk whitelist.json failed to parse last refresh.
-    /// While set, mc-tui refuses to write to whitelist.json (would clobber the
+    /// While set, shulker refuses to write to whitelist.json (would clobber the
     /// real, hand-edited file with our empty in-memory copy).
     pub whitelist_corrupt: bool,
     /// Same idea for ops.json.
@@ -376,11 +368,9 @@ struct App {
     pub sakurafrp_address: Option<String>,
     // v0.9 — Docker container name for the SakuraFrp launcher + cached
     // last-probed state.
-    pub sakurafrp_container: String,
-    pub sakurafrp_docker: SakuraFrpDocker,
 
     // v0.10 — SakuraFrp API integration. Token is read from
-    // ~/.config/mc-tui/natfrp.token (0600); other fields are populated by
+    // ~/.config/shulker/natfrp.token (0600); other fields are populated by
     // refresh_natfrp() on demand (first tab visit + user-triggered refresh).
     // We never call the API from refresh_all() — would block the redraw loop.
     pub natfrp_token: Option<String>,
@@ -392,12 +382,6 @@ struct App {
     /// True after the first refresh_natfrp() in this session — gates auto-load
     /// on first tab visit so we don't keep re-firing requests.
     pub natfrp_loaded: bool,
-
-    // v0.12 — Sparkle/mihomo presence indicator. Pure cache; refresh_all() walks
-    // proc table once per refresh tick. Surfaced on the SakuraFrp tab as a dim
-    // warning line, since the user has explicitly said the auto-kill behavior
-    // is off-limits.
-    pub mihomo_running: bool,
 
     // v0.13 — full-screen node picker overlay. `Some` while the user is in the
     // create-tunnel-step-2 or migrate-tunnel flows; key events route to the
@@ -412,10 +396,10 @@ struct App {
     // when the launcher container isn't running — UI then renders ? markers.
     pub natfrp_tunnel_enabled: std::collections::HashMap<u64, bool>,
 
-    // v0.15 — direct frpc subprocess management. mc-tui now runs frpc itself
+    // v0.15 — direct frpc subprocess management. shulker now runs frpc itself
     // (via tmux) instead of going through the SakuraFrp launcher container.
     // Source-of-truth for "which tunnels are enabled" is `frpc_enabled_ids`,
-    // persisted in state.toml so it survives mc-tui restarts. `frpc_pid` is
+    // persisted in state.toml so it survives shulker restarts. `frpc_pid` is
     // probed each refresh from the process table, sysinfo-style.
     pub frpc_binary: Option<PathBuf>,
     pub frpc_pid: Option<u32>,
@@ -423,6 +407,11 @@ struct App {
     /// Cached download manifest from `/v4/system/clients`. Populated lazily
     /// the first time the user is told they need to fetch a binary.
     pub clients_manifest: Option<natfrp::ClientsManifest>,
+
+    // v0.17 — Console abstraction. Linux/macOS = tmux ref (stateless),
+    // Windows = ConPTY state. Re-created when the user switches `--server-dir`.
+    pub server_console: console::Console,
+    pub frpc_console: console::Console,
 
     pub status: String,
     /// v0.16 — toast (transient status). UI renders in content-area corner;
@@ -458,6 +447,8 @@ impl App {
         })?;
         let properties = read_properties(&server_dir.join("server.properties"))
             .context("read server.properties")?;
+        let server_console = console::Console::new(console::ConsoleRole::Server, &server_dir);
+        let frpc_console = console::Console::new(console::ConsoleRole::Frpc, &server_dir);
         let mut app = App {
             server_dir,
             properties,
@@ -486,10 +477,6 @@ impl App {
             // Pull persisted SakuraFrp address so the join-bar shows the
             // public entry from the start of the session.
             sakurafrp_address: read_persisted_state().sakurafrp_address,
-            sakurafrp_container: read_persisted_state()
-                .sakurafrp_container
-                .unwrap_or_else(|| DEFAULT_SAKURAFRP_CONTAINER.to_string()),
-            sakurafrp_docker: SakuraFrpDocker::default(),
             natfrp_token: read_natfrp_token(),
             natfrp_user: None,
             natfrp_tunnels: Vec::new(),
@@ -497,7 +484,6 @@ impl App {
             natfrp_last_error: None,
             natfrp_state: ListState::default(),
             natfrp_loaded: false,
-            mihomo_running: false,
             node_picker: None,
             create_tunnel_draft: None,
             natfrp_tunnel_enabled: HashMap::new(),
@@ -505,6 +491,8 @@ impl App {
             frpc_pid: None,
             frpc_enabled_ids: read_persisted_state().frpc_enabled_ids,
             clients_manifest: None,
+            server_console,
+            frpc_console,
             status: String::new(),
             toast: None,
             overlay: Overlay::None,
@@ -573,17 +561,15 @@ impl App {
         self.pid = server_running_pid(&self.server_dir, self.pid);
         self.yaml_files = list_yaml_files(&self.server_dir);
         self.backups = scan_backups(&self.server_dir);
-        self.sakurafrp_docker = detect_sakurafrp_docker(&self.sakurafrp_container);
-        self.mihomo_running = mihomo_running();
         // v0.15 — re-discover the frpc binary every refresh so the user can
-        // drop one in mid-session and not have to restart mc-tui. Cheap
+        // drop one in mid-session and not have to restart shulker. Cheap
         // (PATH walk + one stat).
         self.frpc_binary = find_frpc_binary();
-        // Only count frpc that mc-tui actually launched: gate on the tmux
-        // session being alive. Otherwise sysinfo would see frpc instances
-        // running inside someone else's container (e.g. natfrp-service)
-        // and falsely report Active.
-        self.frpc_pid = if sys::frpc_tmux_alive(&self.server_dir) {
+        // Only count frpc that shulker actually launched: gate on the
+        // platform console session being alive. Otherwise sysinfo would see
+        // frpc instances running inside someone else's container
+        // (e.g. natfrp-service) and falsely report Active.
+        self.frpc_pid = if self.frpc_console.is_alive() {
             detect_frpc_pid(self.frpc_pid)
         } else {
             None
@@ -801,7 +787,7 @@ impl App {
         //     is alive — nothing to do.
         // The recovery case — `enable && already && !frpc_alive` — falls
         // through so pressing `e` on an enabled tunnel after a daemon crash
-        // (or a fresh mc-tui session where state.toml carries enabled ids
+        // (or a fresh shulker session where state.toml carries enabled ids
         // but no process is running yet) restarts the forwarder. Without
         // this, the old behavior left the user no UI path to restart the
         // forwarder short of `x` then `e`.
@@ -1109,15 +1095,11 @@ impl App {
         }
     }
 
-    fn frpc_session_name(&self) -> String {
-        sys::frpc_tmux_session_name(&self.server_dir)
-    }
-
-    /// Start frpc inside a detached tmux session. No-op if already running.
-    /// Returns Err with a translated reason if any prerequisite is missing
-    /// (binary, token, tmux).
+    /// Start frpc inside the platform's console abstraction. No-op if already
+    /// running. Returns Err with a translated reason if any prerequisite is
+    /// missing (binary, token, no tunnels enabled).
     fn start_frpc(&mut self) -> Result<()> {
-        if sys::frpc_tmux_alive(&self.server_dir) {
+        if self.frpc_console.is_alive() {
             return Ok(());
         }
         let Some(binary) = self.frpc_binary.clone() else {
@@ -1135,57 +1117,34 @@ impl App {
                 Lang::Zh => "没有启用任何隧道（先在隧道列表里按 e 启用）",
             });
         }
-        let session = self.frpc_session_name();
         let ids_joined: Vec<String> =
             self.frpc_enabled_ids.iter().map(u64::to_string).collect();
-        // frpc -f "<token>:<id1>,<id2>" -n     (no version-check on startup;
-        // this is the user's machine, frpc updates are out-of-band)
+        // frpc -f "<token>:<id1>,<id2>" -n   (no version-check on startup —
+        // frpc updates are out-of-band on the user's machine)
         let fetch_arg = format!("{}:{}", token, ids_joined.join(","));
-        let frpc_cmd = format!(
-            "{} -f {} -n",
-            sys::shell_quote_sh(&binary.display().to_string()),
-            sys::shell_quote_sh(&fetch_arg),
-        );
-        let status = std::process::Command::new("tmux")
-            .args([
-                "new-session",
-                "-d",
-                "-s",
-                &session,
-                "-c",
-                &self.server_dir.display().to_string(),
-                &frpc_cmd,
-            ])
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .with_context(|| "spawn tmux for frpc")?;
-        if !status.success() {
-            anyhow::bail!("tmux new-session failed for frpc");
-        }
+        let argv = vec![
+            binary.display().to_string(),
+            "-f".to_string(),
+            fetch_arg,
+            "-n".to_string(),
+        ];
+        self.frpc_console
+            .start(&argv)
+            .with_context(|| "start frpc console")?;
         // Give the proc table a moment so the next refresh sees the pid.
         std::thread::sleep(std::time::Duration::from_millis(200));
         self.frpc_pid = data::detect_frpc_pid(self.frpc_pid);
         Ok(())
     }
 
-    /// Stop frpc by killing its tmux session. SIGINT → frpc exits cleanly.
+    /// Stop frpc by killing its console session. frpc handles SIGINT cleanly.
     fn stop_frpc(&mut self) -> Result<()> {
-        let session = self.frpc_session_name();
-        if !sys::tmux_session_alive(&session) {
+        if !self.frpc_console.is_alive() {
             return Ok(());
         }
-        let status = std::process::Command::new("tmux")
-            .args(["kill-session", "-t", &session])
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .with_context(|| "kill tmux session for frpc")?;
-        if !status.success() {
-            anyhow::bail!("tmux kill-session failed");
-        }
+        self.frpc_console
+            .kill_session()
+            .with_context(|| "kill frpc console")?;
         // Poll briefly for pid to vanish — frpc handles SIGINT in <100 ms.
         for _ in 0..30 {
             if data::detect_frpc_pid(None).is_none() {
@@ -1242,13 +1201,8 @@ impl App {
 
         if let Some(url) = url_opt.as_deref() {
             // Best-effort copy to clipboard. Failure here is silent — the
-            // URL is still in the status message.
-            let _ = std::process::Command::new("wl-copy")
-                .arg(url)
-                .stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status();
+            // URL is still in the status message either way.
+            let _ = sys::clipboard_copy(url);
             match self.lang {
                 Lang::En => format!(
                     "✗ frpc not found. Download {} → save to {} (chmod +x). URL copied to clipboard.",
@@ -1275,65 +1229,36 @@ impl App {
         }
     }
 
-    /// v0.12 — fire `xdg-open` on the SakuraFrp access-key page so the user
-    /// doesn't have to remember the URL or click around the dashboard. Falls
-    /// back to copying the URL via wl-copy when xdg-open isn't available
-    /// (headless / no portal). The deep link lands on the access-key tab.
+    /// v0.12 — open the SakuraFrp access-key page in the user's default
+    /// browser. Falls back to copying the URL to the clipboard when no
+    /// browser is reachable (headless / SSH / no portal). The deep link
+    /// lands on the access-key tab.
     fn open_natfrp_dashboard(&mut self) {
         const URL: &str = "https://www.natfrp.com/user/edit/auth#info-key";
-        let opened = std::process::Command::new("xdg-open")
-            .arg(URL)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
-        if opened {
+        if sys::open_url(URL).is_ok() {
             self.status = match self.lang {
                 Lang::En => format!("✓ Opened {} in your browser.", URL),
                 Lang::Zh => format!("✓ 已在浏览器打开 {}。", URL),
             };
             return;
         }
-        // Best-effort clipboard fallback. Tell the user even when wl-copy
+        // Best-effort clipboard fallback. Tell the user even when copy
         // succeeds — they may have expected a browser to pop.
-        let copied = std::process::Command::new("wl-copy")
-            .arg(URL)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
+        let copied = sys::clipboard_copy(URL).is_ok();
         self.status = match (self.lang, copied) {
             (Lang::En, true) => {
-                format!("ℹ xdg-open unavailable; copied {} to clipboard.", URL)
+                format!("ℹ Browser unavailable; copied {} to clipboard.", URL)
             }
             (Lang::En, false) => {
                 format!("ℹ Open this URL manually: {}", URL)
             }
             (Lang::Zh, true) => {
-                format!("ℹ xdg-open 不可用；已把 {} 复制到剪贴板。", URL)
+                format!("ℹ 浏览器不可用；已把 {} 复制到剪贴板。", URL)
             }
             (Lang::Zh, false) => {
                 format!("ℹ 请手动打开此 URL：{}", URL)
             }
         };
-    }
-
-    /// v0.15 — show the "press S to start frpc" hint when at least one
-    /// tunnel is configured to be enabled but frpc itself isn't running.
-    /// Stays quiet when there are no tunnels (user hasn't done create-tunnel
-    /// yet) or when frpc is up.
-    fn launcher_hint_applicable(&self) -> bool {
-        if self.natfrp_tunnels.is_empty() {
-            return false;
-        }
-        if self.frpc_pid.is_some() {
-            return false;
-        }
-        !self.frpc_enabled_ids.is_empty()
     }
 
     fn set_natfrp_token(&mut self, token: &str) -> Result<()> {
@@ -1378,8 +1303,8 @@ impl App {
         self.sakurafrp_address.clone()
     }
 
-    /// Y on Overview — copy the multi-line share text to clipboard via
-    /// wl-copy. Picks frp address if configured (preferred for non-LAN
+    /// Y on Overview — copy the multi-line share text to the system
+    /// clipboard. Picks frp address if configured (preferred for non-LAN
     /// friends); otherwise primary LAN interface.
     pub fn copy_share_text(&mut self) {
         let nics = detect_interfaces();
@@ -1392,19 +1317,12 @@ impl App {
         let frp_addr = self.effective_sakurafrp_address();
         let lan = primary.map(|n| (n.ip.to_string(), port));
         let text = crate::ui::build_share_text(self, lan, frp_addr.as_deref());
-        let copied = std::process::Command::new("wl-copy")
-            .arg(&text)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
+        let copied = sys::clipboard_copy(&text).is_ok();
         let msg: String = match (self.lang, copied) {
             (Lang::En, true) => "✓ Share text copied to clipboard.".into(),
-            (Lang::En, false) => "ℹ wl-copy unavailable — copy from the preview manually.".into(),
+            (Lang::En, false) => "ℹ Clipboard unavailable — copy from the preview manually.".into(),
             (Lang::Zh, true) => "✓ 分享文本已复制到剪贴板。".into(),
-            (Lang::Zh, false) => "ℹ wl-copy 不可用 — 请手动复制预览。".into(),
+            (Lang::Zh, false) => "ℹ 剪贴板不可用 — 请手动复制预览。".into(),
         };
         self.set_status(msg);
     }
@@ -1426,19 +1344,12 @@ impl App {
             };
             return;
         };
-        let copied = std::process::Command::new("wl-copy")
-            .arg(&addr)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
+        let copied = sys::clipboard_copy(&addr).is_ok();
         self.status = match (self.lang, copied) {
             (Lang::En, true) => format!("✓ Copied {} to clipboard", addr),
-            (Lang::En, false) => format!("ℹ {} (wl-copy unavailable)", addr),
+            (Lang::En, false) => format!("ℹ {} (clipboard unavailable)", addr),
             (Lang::Zh, true) => format!("✓ 已复制 {} 到剪贴板", addr),
-            (Lang::Zh, false) => format!("ℹ {}（wl-copy 不可用）", addr),
+            (Lang::Zh, false) => format!("ℹ {}（剪贴板不可用）", addr),
         };
     }
 
@@ -2078,62 +1989,47 @@ impl App {
                 return Ok(());
             }
         };
-        let (unit_name, command, description) = match kind {
-            ServerAction::ScheduleDailyRestart => (
-                format!("mc-tui-restart-{}", server_dir_slug(&self.server_dir)),
-                format!(
-                    "/usr/bin/env bash -c 'cd {0:?} && (test -x ./stop.sh && ./stop.sh || pkill -TERM -f \"java.*paper\\|purpur\"; sleep 30; setsid bash {0:?}/start.sh)'",
-                    self.server_dir
-                ),
-                "mc-tui daily restart".to_string(),
-            ),
-            ServerAction::ScheduleDailyBackup => (
-                format!("mc-tui-backup-{}", server_dir_slug(&self.server_dir)),
-                format!("/usr/bin/env bash {:?}/backup.sh", self.server_dir),
-                "mc-tui daily backup".to_string(),
-            ),
+        let job_kind = match kind {
+            ServerAction::ScheduleDailyRestart => scheduler::JobKind::Restart,
+            ServerAction::ScheduleDailyBackup => scheduler::JobKind::Backup,
             _ => return Ok(()),
         };
-        let unit_dir = config_dir().parent().unwrap_or(Path::new(".")).join("systemd").join("user");
-        if let Err(e) = fs::create_dir_all(&unit_dir) {
-            self.status = match self.lang {
-                Lang::En => format!("✗ create {}: {}", unit_dir.display(), e),
-                Lang::Zh => format!("✗ 创建 {} 失败：{}", unit_dir.display(), e),
-            };
-            return Ok(());
-        }
-        let service = format!(
-            "[Unit]\nDescription={desc}\n\n[Service]\nType=oneshot\nWorkingDirectory={cwd:?}\nExecStart={cmd}\n",
-            desc = description,
-            cwd = self.server_dir,
-            cmd = command
-        );
-        let timer = format!(
-            "[Unit]\nDescription={desc} timer\n\n[Timer]\nOnCalendar=*-*-* {h:02}:{m:02}:00\nPersistent=true\nUnit={name}.service\n\n[Install]\nWantedBy=timers.target\n",
-            desc = description,
-            h = hour,
-            m = minute,
-            name = unit_name
-        );
-        let svc_path = unit_dir.join(format!("{}.service", unit_name));
-        let tim_path = unit_dir.join(format!("{}.timer", unit_name));
-        if let Err(e) = fs::write(&svc_path, &service).and_then(|_| fs::write(&tim_path, &timer)) {
-            self.status = match self.lang {
-                Lang::En => format!("✗ write unit: {}", e),
-                Lang::Zh => format!("✗ 写入 unit 失败：{}", e),
-            };
-            return Ok(());
-        }
-        self.status = match self.lang {
-            Lang::En => format!(
-                "✓ Wrote {} + .timer. Then: systemctl --user daemon-reload && systemctl --user enable --now {}.timer",
-                svc_path.display(),
-                unit_name
+        let outcome = match scheduler::schedule_daily(job_kind, &self.server_dir, hour, minute) {
+            Ok(o) => o,
+            Err(e) => {
+                self.status = match self.lang {
+                    Lang::En => format!("✗ schedule failed: {}", e),
+                    Lang::Zh => format!("✗ 计划任务创建失败：{}", e),
+                };
+                return Ok(());
+            }
+        };
+        self.status = match (self.lang, &outcome) {
+            (Lang::En, scheduler::ScheduleOutcome::Activated { unschedule_command }) => {
+                format!(
+                    "✓ Scheduled. To unschedule: {}",
+                    unschedule_command
+                )
+            }
+            (Lang::Zh, scheduler::ScheduleOutcome::Activated { unschedule_command }) => {
+                format!(
+                    "✓ 已注册定时任务。取消命令：{}",
+                    unschedule_command
+                )
+            }
+            (
+                Lang::En,
+                scheduler::ScheduleOutcome::WroteFile { path, activate_command, .. },
+            ) => format!(
+                "✓ Wrote {}. Activate: {}",
+                path, activate_command
             ),
-            Lang::Zh => format!(
-                "✓ 已写入 {} 和 .timer。下一步：systemctl --user daemon-reload && systemctl --user enable --now {}.timer",
-                svc_path.display(),
-                unit_name
+            (
+                Lang::Zh,
+                scheduler::ScheduleOutcome::WroteFile { path, activate_command, .. },
+            ) => format!(
+                "✓ 已写入 {}。激活：{}",
+                path, activate_command
             ),
         };
         Ok(())
@@ -2154,14 +2050,10 @@ impl App {
             self.status = self.lang.s().server_pregen_no_running.into();
             return Ok(());
         }
-        let session = tmux_session_name(&self.server_dir);
-        if which("tmux").is_none() || !tmux_session_alive(&session) {
+        if !self.server_console.is_alive() {
             self.status = match self.lang {
-                Lang::En => format!(
-                    "✗ tmux session '{}' is not alive — start the server with S first.",
-                    session
-                ),
-                Lang::Zh => format!("✗ tmux 会话 '{}' 不存在 — 请先按 S 启动服务器。", session),
+                Lang::En => "✗ Server console isn't running — start the server with S first.".into(),
+                Lang::Zh => "✗ 服务器控制台未运行 — 请先按 S 启动服务器。".into(),
             };
             return Ok(());
         }
@@ -2172,53 +2064,49 @@ impl App {
             format!("chunky radius {}", radius),
             "chunky start".to_string(),
         ];
-        use std::process::Command;
         for c in &cmds {
-            let res = Command::new("tmux")
-                .args(["send-keys", "-t", &session, c, "Enter"])
-                .status();
-            match res {
-                Ok(s) if s.success() => {}
-                Ok(s) => {
-                    self.status = match self.lang {
-                        Lang::En => format!("✗ tmux send-keys exited {:?}", s.code()),
-                        Lang::Zh => format!("✗ tmux send-keys 退出码 {:?}", s.code()),
-                    };
-                    return Ok(());
-                }
-                Err(e) => {
-                    self.status = match self.lang {
-                        Lang::En => format!("✗ tmux send-keys: {}", e),
-                        Lang::Zh => format!("✗ tmux send-keys 失败：{}", e),
-                    };
-                    return Ok(());
-                }
+            if let Err(e) = self.server_console.send_line(c) {
+                self.status = match self.lang {
+                    Lang::En => format!("✗ console send-line failed: {}", e),
+                    Lang::Zh => format!("✗ 控制台发送失败：{}", e),
+                };
+                return Ok(());
             }
         }
-        self.status = match self.lang {
-            Lang::En => format!(
-                "✓ Pre-gen sent (radius {}). Attach with `tmux attach -t {}` to watch.",
-                radius, session
+        let attach = self.server_console.attach_command();
+        self.status = match (self.lang, attach.as_deref()) {
+            (Lang::En, Some(a)) => format!(
+                "✓ Pre-gen sent (radius {}). Attach with `{}` to watch.",
+                radius, a
             ),
-            Lang::Zh => format!(
-                "✓ 已发送区块预加载（半径 {}）。`tmux attach -t {}` 查看进度。",
-                radius, session
+            (Lang::En, None) => format!(
+                "✓ Pre-gen sent (radius {}). Watch progress in the Logs tab (L).",
+                radius
+            ),
+            (Lang::Zh, Some(a)) => format!(
+                "✓ 已发送区块预加载（半径 {}）。`{}` 查看进度。",
+                radius, a
+            ),
+            (Lang::Zh, None) => format!(
+                "✓ 已发送区块预加载（半径 {}）。在 Logs tab (L) 查看进度。",
+                radius
             ),
         };
         Ok(())
     }
 
     fn show_attach_command(&mut self) {
-        let session = tmux_session_name(&self.server_dir);
-        let cmd = format!("tmux attach -t {}", session);
-        let alive = which("tmux").is_some() && tmux_session_alive(&session);
-        // Best-effort copy to wl-clipboard; ignore failures (e.g. headless / no wayland).
-        let _ = std::process::Command::new("wl-copy")
-            .arg(&cmd)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status();
+        let Some(cmd) = self.server_console.attach_command() else {
+            // Windows: no attach. Point users at the Logs tab instead.
+            self.status = match self.lang {
+                Lang::En => "ℹ No attach on this platform — watch the server in the Logs tab (L).".into(),
+                Lang::Zh => "ℹ 此平台不支持 attach — 请在 Logs tab (L) 查看服务器输出。".into(),
+            };
+            return;
+        };
+        let alive = self.server_console.is_alive();
+        // Best-effort copy; ignore failures (e.g. headless / no clipboard).
+        let _ = sys::clipboard_copy(&cmd);
         self.status = match (self.lang, alive) {
             (Lang::En, true) => format!("ℹ Copied to clipboard: {}", cmd),
             (Lang::En, false) => format!("ℹ {} (session not yet alive)", cmd),
@@ -2281,148 +2169,78 @@ impl App {
             self.status = self.lang.s().err_already_running.into();
             return Ok(());
         }
-        let script = self.server_dir.join("start.sh");
+        // Pick the OS-native launch script. `shulker new` writes start.sh on
+        // Unix and start.bat on Windows. We don't try to fall back from one
+        // to the other — bash on Windows would need WSL, and cmd on Unix is
+        // pointless.
+        let script_name = if cfg!(windows) { "start.bat" } else { "start.sh" };
+        let script = self.server_dir.join(script_name);
         if !script.exists() {
             self.status = fmt_start_script_missing(self.lang, &script);
             return Ok(());
         }
-        use std::process::{Command, Stdio};
 
-        // Preferred: launch inside a detached tmux session so we can later send
-        // the `stop` console command — it runs Minecraft's own shutdown path
-        // (synchronous save on the main thread) instead of relying on JVM
-        // signal handlers, which we've seen race with startup and end up half-dead.
-        let session = tmux_session_name(&self.server_dir);
-        if which("tmux").is_some() {
-            // Re-attach situation: if a session by this name already exists,
-            // assume it's our previous server and tell the user.
-            if tmux_session_alive(&session) {
-                self.status = match self.lang {
-                    Lang::En => format!(
-                        "→ tmux session '{}' already exists. Attach with: tmux attach -t {}",
-                        session, session
-                    ),
-                    Lang::Zh => format!(
-                        "→ tmux 会话 '{}' 已存在。接管：tmux attach -t {}",
-                        session, session
-                    ),
-                };
-                return Ok(());
-            }
-            // tmux passes the command string to `/bin/sh -c`; quote the path
-            // so spaces, quotes, $, ` etc. in server-dir don't break the launch.
-            let cmd_str = format!("bash {}", shell_quote_sh(&script.display().to_string()));
-            let res = Command::new("tmux")
-                .arg("new-session")
-                .arg("-d")
-                .arg("-s")
-                .arg(&session)
-                .arg("-c")
-                .arg(&self.server_dir)
-                .arg(&cmd_str)
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status();
-            match res {
-                Ok(s) if s.success() => {
-                    self.status = match self.lang {
-                        Lang::En => format!(
-                            "✓ Started in tmux session '{}'. Attach: tmux attach -t {}",
-                            session, session
-                        ),
-                        Lang::Zh => format!(
-                            "✓ 已在 tmux 会话 '{}' 中启动。接管：tmux attach -t {}",
-                            session, session
-                        ),
-                    };
-                    return Ok(());
-                }
-                Ok(s) => {
-                    self.status = fmt_spawn_failed(self.lang, &format!("tmux exited {:?}", s.code()));
-                    return Ok(());
-                }
-                Err(e) => {
-                    self.status = fmt_spawn_failed(self.lang, &e.to_string());
-                    return Ok(());
-                }
-            }
+        // Re-attach situation: if the (Unix) tmux session is already up, it's
+        // our previous server. Tell the user how to attach instead of double-spawning.
+        if self.server_console.is_alive() {
+            let attach = self.server_console.attach_command()
+                .unwrap_or_else(|| self.server_console.session_name.clone());
+            self.status = match self.lang {
+                Lang::En => format!("→ Server console already running. Attach: {}", attach),
+                Lang::Zh => format!("→ 服务器控制台已在运行。接管：{}", attach),
+            };
+            return Ok(());
         }
 
-        // Fallback: setsid bash (no console — `stop` will rely on SIGTERM and may race).
-        let mut cmd = if cfg!(unix) && which("setsid").is_some() {
-            let mut c = Command::new("setsid");
-            c.arg("bash").arg(&script);
-            c
+        // argv form: Unix runs `bash start.sh`, Windows runs `start.bat` directly.
+        // (Windows .bat files are spawnable as a "command" via ConPTY through
+        // CommandBuilder; cmd.exe handles the parsing.)
+        let argv: Vec<String> = if cfg!(windows) {
+            vec![script.display().to_string()]
         } else {
-            let mut c = Command::new("bash");
-            c.arg(&script);
-            c
+            vec!["bash".to_string(), script.display().to_string()]
         };
-        cmd.current_dir(&self.server_dir)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
-        match cmd.spawn() {
-            Ok(_) => self.status = self.lang.s().spawn_started.into(),
+
+        match self.server_console.start(&argv) {
+            Ok(()) => {
+                let attach_hint = self.server_console.attach_command();
+                self.status = match (self.lang, attach_hint.as_deref()) {
+                    (Lang::En, Some(cmd)) => {
+                        format!("✓ Server console started. Attach: {}", cmd)
+                    }
+                    (Lang::En, None) => {
+                        "✓ Server started. Watch output in the Logs tab (L); closing shulker will stop the server.".into()
+                    }
+                    (Lang::Zh, Some(cmd)) => {
+                        format!("✓ 服务器控制台已启动。接管：{}", cmd)
+                    }
+                    (Lang::Zh, None) => {
+                        "✓ 服务器已启动。在 Logs tab (L) 查看输出；关闭 shulker 会停服。".into()
+                    }
+                };
+            }
             Err(e) => self.status = fmt_spawn_failed(self.lang, &e.to_string()),
         }
         Ok(())
     }
 
     fn stop_server(&mut self) -> Result<()> {
-        let Some(pid) = self.pid else {
+        if self.pid.is_none() && !self.server_console.is_alive() {
             self.status = self.lang.s().err_not_running.into();
             return Ok(());
-        };
-        use std::process::Command;
-
-        // Prefer the tmux console — `stop` runs Minecraft's own shutdown handler
-        // on the main server thread, which is the only path that's reliable.
-        let session = tmux_session_name(&self.server_dir);
-        if which("tmux").is_some() && tmux_session_alive(&session) {
-            let res = Command::new("tmux")
-                .args(["send-keys", "-t", &session, "stop", "Enter"])
-                .status();
-            match res {
-                Ok(s) if s.success() => {
-                    self.status = match self.lang {
-                        Lang::En => format!(
-                            "→ Sent `stop` to tmux session '{}'. Watching for exit…",
-                            session
-                        ),
-                        Lang::Zh => format!(
-                            "→ 已向 tmux 会话 '{}' 发送 `stop`，等待退出…",
-                            session
-                        ),
-                    };
-                    return Ok(());
-                }
-                Ok(s) => {
-                    self.status = fmt_kill_failed(
-                        self.lang,
-                        &format!("tmux send-keys exited {:?}", s.code()),
-                    );
-                    return Ok(());
-                }
-                Err(e) => {
-                    self.status = fmt_kill_failed(self.lang, &e.to_string());
-                    return Ok(());
-                }
-            }
         }
 
-        // Fallback: SIGTERM the detected pid. JVM shutdown hook may stall under
-        // race conditions; if so, the user can SIGKILL manually.
-        #[cfg(unix)]
-        let res = Command::new("kill").arg("-TERM").arg(pid.to_string()).status();
-        #[cfg(not(unix))]
-        let res = Command::new("taskkill")
-            .arg("/PID")
-            .arg(pid.to_string())
-            .status();
-        match res {
-            Ok(_) => self.status = fmt_stop_sent(self.lang, pid),
+        // Send the literal text "stop" + Enter to the console — Minecraft's
+        // synchronous shutdown handler runs on the main thread, which is the
+        // only reliable shutdown path. SIGTERM races with startup and can
+        // leave a half-dead JVM (port closed, world ticking, no progress).
+        match self.server_console.stop_graceful("stop") {
+            Ok(()) => {
+                self.status = match self.lang {
+                    Lang::En => "→ Sent `stop` to server console. Watching for exit…".into(),
+                    Lang::Zh => "→ 已向服务器控制台发送 `stop`，等待退出…".into(),
+                };
+            }
             Err(e) => self.status = fmt_kill_failed(self.lang, &e.to_string()),
         }
         Ok(())
@@ -2491,6 +2309,11 @@ impl App {
         };
         self.server_dir = canonical;
         self.properties = read_properties(&self.server_dir.join("server.properties"))?;
+
+        // Re-bind the console handles to the new server-dir so the tmux
+        // session names / ConPTY working dirs follow the switch.
+        self.server_console = console::Console::new(console::ConsoleRole::Server, &self.server_dir);
+        self.frpc_console = console::Console::new(console::ConsoleRole::Frpc, &self.server_dir);
 
         // Drop YAML editor state — yaml_root / yaml_rows belong to the OLD dir
         // and yaml_save_current would otherwise dump them into the NEW dir's
@@ -3069,19 +2892,12 @@ fn handle_mouse(app: &mut App, me: MouseEvent) {
     let chips = app.join_chips.clone();
     for (r, payload) in chips {
         if rect_contains(r, col, row) {
-            let copied = std::process::Command::new("wl-copy")
-                .arg(&payload)
-                .stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status()
-                .map(|s| s.success())
-                .unwrap_or(false);
+            let copied = sys::clipboard_copy(&payload).is_ok();
             app.status = match (app.lang, copied) {
                 (Lang::En, true) => format!("✓ Copied {} to clipboard", payload),
-                (Lang::En, false) => format!("ℹ {} (wl-copy unavailable)", payload),
+                (Lang::En, false) => format!("ℹ {} (clipboard unavailable)", payload),
                 (Lang::Zh, true) => format!("✓ 已复制 {} 到剪贴板", payload),
-                (Lang::Zh, false) => format!("ℹ {}（wl-copy 不可用）", payload),
+                (Lang::Zh, false) => format!("ℹ {}（剪贴板不可用）", payload),
             };
             return;
         }
@@ -3351,24 +3167,6 @@ mod tests {
     }
 
     #[test]
-    fn toast_kind_durations_distinguish_severity() {
-        // Err / Warn linger longer so the user has time to read them; Ok / Info
-        // are quick (3s).
-        assert!(ToastKind::Err.duration() > ToastKind::Ok.duration());
-        assert!(ToastKind::Warn.duration() > ToastKind::Info.duration());
-        assert_eq!(ToastKind::Ok.duration(), ToastKind::Info.duration());
-    }
-
-    #[test]
-    fn logs_overlay_default_is_autotail_server() {
-        let s = LogsOverlay::default();
-        assert!(s.is_autotail());
-        assert_eq!(s.scroll_back, 0);
-        assert_eq!(s.source, LogsView::Server);
-        assert_eq!(s.filter, LogsLevelFilter::All);
-    }
-
-    #[test]
     fn offline_uuid_format_and_version_bits() {
         // Algorithm: md5("OfflinePlayer:" + name), then set version (3) and variant bits.
         // Format must be 8-4-4-4-12 hex digits. Char 14 must be '3' (version 3).
@@ -3455,7 +3253,7 @@ mod tests {
 
     fn tempdir() -> PathBuf {
         let p = std::env::temp_dir().join(format!(
-            "mc-tui-test-{}",
+            "shulker-test-{}",
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
@@ -3558,51 +3356,10 @@ mod tests {
     }
 
     #[test]
-    fn property_zh_covers_common_keys() {
-        for key in [
-            "max-players",
-            "view-distance",
-            "difficulty",
-            "gamemode",
-            "pvp",
-            "online-mode",
-            "white-list",
-            "motd",
-            "level-name",
-            "server-port",
-        ] {
-            assert!(property_zh(key).is_some(), "missing zh annotation for {key}");
-        }
-        // Unknown keys should return None, not a fallback string.
+    fn property_zh_unknown_key_returns_none() {
+        // Fallback path: unknown keys must return None so the UI shows the raw
+        // key, not an empty annotation.
         assert!(property_zh("not-a-real-key").is_none());
-    }
-
-    #[test]
-    fn strings_struct_fields_nonempty_in_both_langs() {
-        // Spot-check a few fields — important ones we know we render.
-        for s in [&EN, &ZH] {
-            assert!(!s.ready.is_empty());
-            assert!(!s.refreshed.is_empty());
-            assert!(!s.tab_worlds.is_empty());
-            assert!(!s.hint_worlds.is_empty());
-            assert!(!s.title_logs_prefix.is_empty());
-            assert!(!s.prompt_confirm_cancel.is_empty());
-        }
-    }
-
-    #[test]
-    fn fmt_helpers_return_lang_appropriate_strings() {
-        let en = fmt_world_switched(Lang::En, "test");
-        let zh = fmt_world_switched(Lang::Zh, "test");
-        assert!(en.contains("Switched"));
-        assert!(zh.contains("已切换"));
-        assert!(en != zh);
-
-        let en = fmt_status_running(Lang::En, 42);
-        let zh = fmt_status_running(Lang::Zh, 42);
-        assert!(en.contains("running"));
-        assert!(zh.contains("运行中"));
-        assert!(en.contains("42") && zh.contains("42"));
     }
 
     /// v0.13 — node picker sort: game-friendly first, then VIP ascending,
@@ -3658,7 +3415,7 @@ mod tests {
     }
 
     /// v0.12 — every NatfrpError variant maps to a distinct, language-appropriate
-    /// message, and the action hint (press t / pkill sparkle / wait + r) is
+    /// message, and the action hint (press t / disable proxy / wait + r) is
     /// preserved in both languages. Regressions here would silently revert the
     /// onboarding fix back to the pre-v0.12 "✗ user_info: GET /user/info" mess.
     #[test]
@@ -3692,9 +3449,8 @@ mod tests {
         assert!(en_msgs[2].contains("503"));
         assert!(zh_msgs[3].contains("404"));
         // Network: should mention proxy as the most common workaround. The
-        // exact phrasing is human-friendly (no specific tool names like
-        // "sparkle"/"mihomo" — the user doesn't need to know the brand to
-        // act on it).
+        // exact phrasing is human-friendly — no specific tool names; the user
+        // doesn't need to know which proxy is running to act on it.
         assert!(en_msgs[4].to_lowercase().contains("proxy"));
         assert!(zh_msgs[4].contains("代理"));
         // Distinct messages per variant within the same language.
@@ -3889,21 +3645,6 @@ mod tests {
     }
 
     #[test]
-    fn parse_docker_state_maps_status_strings() {
-        // `running` is the only "live" state we care about; everything else is
-        // some flavour of "not running".
-        assert_eq!(parse_docker_state("running"), DockerState::Running);
-        for s in ["created", "exited", "paused", "restarting", "dead", "removing"] {
-            assert_eq!(parse_docker_state(s), DockerState::Stopped, "{}", s);
-        }
-        // Empty / weird → unknown so we don't lie about the launcher's state.
-        assert_eq!(parse_docker_state(""), DockerState::Unknown);
-        // Whitespace-trimmed (docker inspect output has trailing newline).
-        assert_eq!(parse_docker_state("running\n"), DockerState::Running);
-        assert_eq!(parse_docker_state("  running  "), DockerState::Running);
-    }
-
-    #[test]
     fn nic_kind_priority_orders_lan_first() {
         assert!(nic_kind_priority(NicKind::Lan) < nic_kind_priority(NicKind::Public));
         assert!(nic_kind_priority(NicKind::Public) < nic_kind_priority(NicKind::Tun));
@@ -3926,18 +3667,22 @@ mod tests {
     }
 
     #[test]
-    fn tmux_session_name_stable_and_safe() {
-        // Same dir → same name (so start_server and stop_server agree).
-        assert_eq!(
-            tmux_session_name(Path::new("/mnt/data/mc-server")),
-            tmux_session_name(Path::new("/mnt/data/mc-server"))
-        );
+    fn console_session_name_stable_and_safe() {
+        // Same dir → same name (so start and stop agree across calls).
+        let a = console::Console::new(console::ConsoleRole::Server, Path::new("/mnt/data/mc-server"));
+        let b = console::Console::new(console::ConsoleRole::Server, Path::new("/mnt/data/mc-server"));
+        assert_eq!(a.session_name, b.session_name);
         // No characters tmux would choke on.
-        let n = tmux_session_name(Path::new("/srv/MyServer 2024!"));
-        for c in n.chars() {
-            assert!(c.is_ascii_alphanumeric() || c == '-', "bad char {:?} in {}", c, n);
+        let c = console::Console::new(console::ConsoleRole::Server, Path::new("/srv/MyServer 2024!"));
+        for ch in c.session_name.chars() {
+            assert!(ch.is_ascii_alphanumeric() || ch == '-', "bad char {:?} in {}", ch, c.session_name);
         }
-        assert!(n.starts_with("mc-tui-"));
+        assert!(c.session_name.starts_with("shulker-"));
+        // Server vs frpc share the same slug but have distinct prefixes —
+        // they must never collide in tmux's session table.
+        let frpc = console::Console::new(console::ConsoleRole::Frpc, Path::new("/mnt/data/mc-server"));
+        assert_ne!(a.session_name, frpc.session_name);
+        assert!(frpc.session_name.starts_with("shulker-frpc-"));
     }
 
     #[test]
@@ -3958,80 +3703,8 @@ mod tests {
     }
 
     #[test]
-    fn palette_command_labels_exist_in_both_langs() {
-        // v0.16: PALETTE_COMMANDS replaced SERVER_ACTIONS as the menu the user
-        // actually interacts with. Each entry must have a label in both langs.
-        for action in PALETTE_COMMANDS.iter().copied() {
-            let en = server_action_label(Lang::En, action);
-            let zh = server_action_label(Lang::Zh, action);
-            assert!(!en.is_empty());
-            assert!(!zh.is_empty());
-        }
-    }
-
-    #[test]
-    fn property_metadata_covers_listed_keys() {
-        for key in [
-            "max-players",
-            "view-distance",
-            "simulation-distance",
-            "difficulty",
-            "gamemode",
-            "pvp",
-            "hardcore",
-            "online-mode",
-            "white-list",
-            "enforce-whitelist",
-            "spawn-protection",
-            "motd",
-            "level-name",
-            "level-type",
-            "level-seed",
-            "server-port",
-            "allow-flight",
-            "allow-nether",
-            "spawn-monsters",
-            "spawn-animals",
-            "enable-rcon",
-            "rcon.password",
-            "rcon.port",
-            "op-permission-level",
-            "function-permission-level",
-            "network-compression-threshold",
-            "max-tick-time",
-            "force-gamemode",
-            "generate-structures",
-            "resource-pack",
-            "require-resource-pack",
-            "player-idle-timeout",
-            "entity-broadcast-range-percentage",
-        ] {
-            let m = property_metadata(key).unwrap_or_else(|| panic!("missing meta for {}", key));
-            assert!(!m.description_en.is_empty(), "empty en desc for {}", key);
-            assert!(!m.description_zh.is_empty(), "empty zh desc for {}", key);
-            assert!(!m.range.is_empty(), "empty range for {}", key);
-        }
-    }
-
-    #[test]
     fn property_metadata_unknown_returns_none() {
         assert!(property_metadata("not-a-real-key").is_none());
-    }
-
-    #[test]
-    fn detail_strings_nonempty_in_both_langs() {
-        for s in [&EN, &ZH] {
-            assert!(!s.detail_title.is_empty());
-            assert!(!s.detail_no_selection.is_empty());
-            assert!(!s.detail_no_metadata.is_empty());
-            assert!(!s.detail_path.is_empty());
-            assert!(!s.detail_size.is_empty());
-            assert!(!s.detail_uuid.is_empty());
-            assert!(!s.detail_offline_uuid_note.is_empty());
-            assert!(!s.detail_op_level_4.is_empty());
-            assert!(!s.detail_yes.is_empty());
-            assert!(!s.detail_no.is_empty());
-        }
     }
 
     #[test]

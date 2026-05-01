@@ -11,16 +11,18 @@ use anyhow::{Context, Result};
 
 // ---------- Persistent state (state.toml) ----------
 
+/// OS-native per-user config dir for shulker. Maps to:
+///   - Linux:   `$XDG_CONFIG_HOME/shulker` (or `~/.config/shulker`)
+///   - macOS:   `~/Library/Application Support/shulker`
+///   - Windows: `%APPDATA%\shulker`
+///
+/// Backed by the `dirs` crate, which is the standard `BaseDirs::config_dir`
+/// implementation. Falls back to `.shulker` in CWD if `dirs` can't resolve a
+/// home (containers without `$HOME`, broken `passwd` lookups, etc.).
 pub fn config_dir() -> PathBuf {
-    if let Ok(p) = std::env::var("XDG_CONFIG_HOME") {
-        if !p.is_empty() {
-            return PathBuf::from(p).join("mc-tui");
-        }
-    }
-    if let Ok(home) = std::env::var("HOME") {
-        return PathBuf::from(home).join(".config").join("mc-tui");
-    }
-    PathBuf::from(".mc-tui")
+    dirs::config_dir()
+        .map(|p| p.join("shulker"))
+        .unwrap_or_else(|| PathBuf::from(".shulker"))
 }
 
 pub fn state_path() -> PathBuf {
@@ -71,7 +73,7 @@ pub struct PersistedState {
     /// so existing state.toml files don't error on read.
     pub sakurafrp_container: Option<String>,
     /// v0.15 — comma-separated tunnel ids passed to `frpc -f`. The list of
-    /// tunnels mc-tui auto-starts when the user runs frpc; toggled by `e`/`x`.
+    /// tunnels shulker auto-starts when the user runs frpc; toggled by `e`/`x`.
     pub frpc_enabled_ids: Vec<u64>,
 }
 
@@ -117,7 +119,7 @@ pub fn write_persisted_state(state: &PersistedState) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).ok();
     }
-    let mut s = String::from("# mc-tui state — auto-managed, hand-edit at your own risk.\n");
+    let mut s = String::from("# shulker state — auto-managed, hand-edit at your own risk.\n");
     if let Some(dir) = &state.server_dir {
         s.push_str(&format!("server_dir = \"{}\"\n", dir.display()));
     }
@@ -151,15 +153,12 @@ pub fn parse_hh_mm(s: &str) -> Option<(u8, u8)> {
     Some((h, m))
 }
 
-/// Stable tmux session name keyed off the server-dir basename.
-/// Same dir → same session every time, so `start` / `stop` find the same place.
-pub fn tmux_session_name(server_dir: &Path) -> String {
-    format!("mc-tui-{}", server_dir_slug(server_dir))
-}
-
 /// POSIX-shell-safe single-quote of `s`. tmux `new-session [shell-command]`
 /// passes its command string to `/bin/sh -c`, so any path containing whitespace,
-/// quotes, `$`, backticks, etc. would otherwise break.
+/// quotes, `$`, backticks, etc. would otherwise break. Unix-only: the Windows
+/// console backend talks to ConPTY directly with an argv array and never
+/// needs to round-trip through a shell.
+#[cfg(unix)]
 pub fn shell_quote_sh(s: &str) -> String {
     // `'` inside a single-quoted string is closed with `'`, escaped as `\'`,
     // then re-opened with `'`. Empty input → `''`.
@@ -184,6 +183,10 @@ pub fn shell_quote_sh(s: &str) -> String {
     out
 }
 
+/// True if tmux reports a session by this name. Used by the Unix console
+/// backend; Windows ConPTY tracks its own child handle so this isn't
+/// referenced there.
+#[cfg(unix)]
 pub fn tmux_session_alive(name: &str) -> bool {
     use std::process::{Command, Stdio};
     Command::new("tmux")
@@ -204,28 +207,31 @@ pub fn server_dir_slug(p: &Path) -> String {
         .collect()
 }
 
-pub fn which(prog: &str) -> Option<PathBuf> {
-    let path = std::env::var_os("PATH")?;
-    for dir in std::env::split_paths(&path) {
-        let candidate = dir.join(prog);
-        if candidate.is_file() {
-            return Some(candidate);
-        }
-    }
-    None
+// ---------- Clipboard / browser helpers ----------
+//
+// Cross-platform replacements for the v0.15-era `wl-copy` / `xdg-open`
+// shell-outs. arboard handles Linux (X11 + Wayland), macOS (NSPasteboard),
+// and Windows (OpenClipboard); webbrowser handles xdg-open / open / ShellExecute.
+// Both fail cleanly on headless / SSH-only hosts — callers must surface the
+// `Err` to the user instead of unwrapping.
+
+/// Copy `text` to the system clipboard. Returns `Ok(())` on success; `Err`
+/// when no clipboard is available (typical SSH session, no X11/Wayland, etc.).
+/// Callers turn the error into a "copy failed — copy manually" status hint.
+pub fn clipboard_copy(text: &str) -> Result<()> {
+    let mut clipboard = arboard::Clipboard::new()
+        .with_context(|| "open system clipboard")?;
+    clipboard
+        .set_text(text.to_string())
+        .with_context(|| "write to clipboard")?;
+    Ok(())
 }
 
-/// v0.15 — stable tmux session name for the frpc subprocess. Keyed off the
-/// server-dir slug so two mc-tui instances on different server-dirs don't
-/// fight over a single session.
-pub fn frpc_tmux_session_name(server_dir: &Path) -> String {
-    format!("mc-tui-frpc-{}", server_dir_slug(server_dir))
-}
-
-/// True when `frpc` is up under the tmux session for `server_dir`. Cheap;
-/// `tmux has-session` returns 0/1.
-pub fn frpc_tmux_alive(server_dir: &Path) -> bool {
-    tmux_session_alive(&frpc_tmux_session_name(server_dir))
+/// Open `url` in the user's default browser. Returns `Ok(())` on success;
+/// `Err` when no browser is available (headless, missing xdg-open, etc.).
+pub fn open_url(url: &str) -> Result<()> {
+    webbrowser::open(url).with_context(|| format!("open {} in browser", url))?;
+    Ok(())
 }
 
 pub fn expand_tilde(p: &str) -> PathBuf {

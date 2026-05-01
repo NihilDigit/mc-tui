@@ -17,7 +17,7 @@ use crate::data::{
     YamlDisplay,
 };
 use crate::i18n::{
-    fmt_log_read_error, fmt_status_running, hint_for, property_metadata, property_zh, tab_name,
+    fmt_log_read_error, hint_for, property_metadata, property_zh, tab_name,
     Lang, Strings,
 };
 use crate::{
@@ -424,8 +424,7 @@ fn draw_logs_overlay(f: &mut Frame, app: &App) {
             })
         }
         LogsView::Frpc => {
-            let session = crate::sys::frpc_tmux_session_name(&app.server_dir);
-            crate::data::tmux_capture_pane(&session, 1000).unwrap_or_else(|e| {
+            app.frpc_console.capture_recent(1000).unwrap_or_else(|e| {
                 if zh {
                     format!("(网络转发尚未启动 — 详情：{})", e)
                 } else {
@@ -1768,15 +1767,13 @@ pub fn fmt_age(d: chrono::Duration) -> String {
 }
 
 fn draw_sakurafrp(f: &mut Frame, area: Rect, app: &mut App) {
-    // v0.16 — Network tab layout:
-    //   * mihomo warning line (0 or 1)
+    // v0.17 — Network tab layout:
     //   * user panel (4 or 5 lines based on token state)
     //   * tunnel list (flex)
     //   * NIC list — collapsed (0) by default; expand with `n` (varies)
     //
     // The 4-line "actions" panel from v0.15.1 is gone — keys live in the
     // bottom hint row + `?` overlay covers any forgotten ones.
-    let mihomo_h: u16 = if app.mihomo_running { 1 } else { 0 };
     let user_h: u16 = if app.natfrp_token.is_none() { 5 } else { 4 };
     let nics = detect_interfaces();
     let nics_h: u16 = if app.network_show_nics {
@@ -1788,19 +1785,15 @@ fn draw_sakurafrp(f: &mut Frame, area: Rect, app: &mut App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(mihomo_h),
             Constraint::Length(user_h),
             Constraint::Min(3),
             Constraint::Length(nics_h),
         ])
         .split(area);
 
-    if mihomo_h > 0 {
-        draw_sakurafrp_mihomo_warning(f, chunks[0], app);
-    }
-    draw_sakurafrp_user(f, chunks[1], app);
-    draw_sakurafrp_tunnels(f, chunks[2], app);
-    draw_network_nics(f, chunks[3], app, &nics);
+    draw_sakurafrp_user(f, chunks[0], app);
+    draw_sakurafrp_tunnels(f, chunks[1], app);
+    draw_network_nics(f, chunks[2], app, &nics);
 }
 
 /// Network-tab NIC list. Collapsed by default — single hint line says
@@ -1860,17 +1853,6 @@ fn draw_network_nics(f: &mut Frame, area: Rect, app: &mut App, nics: &[NicInfo])
         ]));
     }
     f.render_widget(Paragraph::new(lines), area);
-}
-
-/// One-line dim warning when Sparkle/mihomo is running. Doesn't block anything;
-/// just primes the user before friends connect.
-fn draw_sakurafrp_mihomo_warning(f: &mut Frame, area: Rect, app: &App) {
-    let s = app.lang.s();
-    let p = Paragraph::new(Line::from(Span::styled(
-        format!(" {}", s.sf_mihomo_warning),
-        Style::default().fg(Color::Yellow),
-    )));
-    f.render_widget(p, area);
 }
 
 fn draw_sakurafrp_user(f: &mut Frame, area: Rect, app: &App) {

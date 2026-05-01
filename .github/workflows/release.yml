@@ -8,6 +8,15 @@ on:
 permissions:
   contents: write
 
+env:
+  # Until actions/checkout and softprops/action-gh-release publish a major
+  # version that bundles a Node.js 24 runtime, opt the runner into the new
+  # JS host explicitly. Without this GitHub forces every Node 20 action onto
+  # Node 24 silently after 2026-06-02 and removes Node 20 entirely on
+  # 2026-09-16; setting it now is the documented forward path.
+  # See: https://github.blog/changelog/2025-09-19-deprecation-of-node-20-on-github-actions-runners/
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
+
 jobs:
   build:
     name: Build ${{ matrix.target }}
@@ -20,8 +29,13 @@ jobs:
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-latest
             cross: true
+          # GitHub-hosted macos-13 runners hit multi-hour queue waits as Apple
+          # winds down x86 capacity, so we cross-compile both Mac targets from
+          # the always-available macos-14 (Apple Silicon) runner. The Apple
+          # SDK ships a fat toolchain that can target x86_64-apple-darwin
+          # natively — no extra cross-compile setup needed beyond `rustup target add`.
           - target: x86_64-apple-darwin
-            os: macos-13
+            os: macos-14
           - target: aarch64-apple-darwin
             os: macos-14
           - target: x86_64-pc-windows-msvc
@@ -52,15 +66,15 @@ jobs:
       - name: Package archive
         shell: bash
         run: |
-          dist=mc-tui-${{ github.ref_name }}-${{ matrix.target }}
+          dist=shulker-${{ github.ref_name }}-${{ matrix.target }}
           mkdir -p "$dist"
           cp CLAUDE.md LICENSE "$dist/"
           if [[ "${{ matrix.target }}" == *windows* ]]; then
-            cp "target/${{ matrix.target }}/release/mc-tui.exe" "$dist/"
+            cp "target/${{ matrix.target }}/release/shulker.exe" "$dist/"
             7z a "${dist}.zip" "$dist"
             echo "ASSET=${dist}.zip" >> "$GITHUB_ENV"
           else
-            cp "target/${{ matrix.target }}/release/mc-tui" "$dist/"
+            cp "target/${{ matrix.target }}/release/shulker" "$dist/"
             tar -czvf "${dist}.tar.gz" "$dist"
             echo "ASSET=${dist}.tar.gz" >> "$GITHUB_ENV"
           fi

@@ -1,4 +1,4 @@
-//! Data layer for mc-tui: pure structures + filesystem / network IO.
+//! Data layer for shulker: pure structures + filesystem / network IO.
 //!
 //! Everything here is independent of the UI. Anything that takes `&App` or
 //! returns ratatui widgets lives in src/main.rs (the UI module hasn't been
@@ -826,62 +826,28 @@ pub fn nic_kind_color(k: NicKind) -> Color {
     }
 }
 
-/// Parse `ip -4 -o addr show` output. Each non-secondary line looks like:
-///   `3: wlan0    inet 10.128.177.76/11 brd ... scope global ...`
-/// We pull out interface name and IP, classify, and return.
+/// Enumerate IPv4 addresses on every local NIC. Cross-platform via the
+/// `if-addrs` crate (Linux/macOS `getifaddrs`, Windows `GetAdaptersAddresses`).
+/// Replaces the old `ip -4 -o addr show` shell-out so the join-bar works on
+/// macOS / Windows too.
 pub fn detect_interfaces() -> Vec<NicInfo> {
-    use std::process::Command;
-    let out = Command::new("ip")
-        .args(["-4", "-o", "addr", "show"])
-        .output();
-    let Ok(out) = out else { return Vec::new() };
-    if !out.status.success() {
-        return Vec::new();
-    }
-    let text = String::from_utf8_lossy(&out.stdout);
+    let Ok(addrs) = if_addrs::get_if_addrs() else { return Vec::new() };
     let mut result = Vec::new();
-    for line in text.lines() {
-        let toks: Vec<&str> = line.split_whitespace().collect();
-        if toks.len() < 4 || toks[2] != "inet" {
-            continue;
-        }
-        let name = toks[1].trim_end_matches(':').to_string();
-        let Some(ip_part) = toks[3].split('/').next() else { continue };
-        let Ok(ip) = ip_part.parse::<std::net::Ipv4Addr>() else { continue };
-        let kind = classify_iface(&name, &ip);
-        result.push(NicInfo { name, ip, kind });
+    for iface in addrs {
+        let std::net::IpAddr::V4(ip) = iface.ip() else { continue };
+        let kind = classify_iface(&iface.name, &ip);
+        result.push(NicInfo { name: iface.name, ip, kind });
     }
     result.sort_by_key(|n| (nic_kind_priority(n.kind), n.name.clone()));
     result
 }
 
-// ---------- SakuraFrp launcher Docker probe ----------
-//
-// SakuraFrp's official launcher ships as a Docker container that runs frpc
-// inside. mc-tui shows whether that container is running and offers
-// start / stop / restart actions — the actual frpc + tunnel config lives in
-// the SakuraFrp web console (https://www.natfrp.com), we don't replicate that.
-//
-// All commands shell out to `docker` (no sudo); status messages bubble up to
-// the App.status hint line. Probing on every refresh adds a single ~80ms
-// `docker inspect` call which is acceptable for a TUI refreshed on key events.
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum DockerState {
-    Running,
-    /// Container exists but is not running (created/exited/paused/dead/restarting).
-    Stopped,
-    /// Container does not exist on this host.
-    Missing,
-    /// `docker` binary not found, or daemon unreachable.
-    #[default]
-    Unknown,
-}
-
-#[derive(Debug, Clone, Default)]
-pub struct SakuraFrpDocker {
-    pub state: DockerState,
-}
+// v0.9–v0.14 had a Docker launcher container probe here (`SakuraFrpDocker`,
+// `DockerState`, `detect_sakurafrp_docker`, `parse_docker_state`). v0.15
+// switched to running frpc directly; v0.17 dropped the probe code as
+// part of the cross-platform port. To revive container management, the
+// pattern was: `docker inspect --format '{{.State.Status}}'` mapped to a
+// 4-variant enum. Git history before v0.17 has the full code.
 
 /// v0.15.1 — Download a binary from `url` to `target` and chmod it 0755.
 /// Streams the response so we don't materialize a 5+ MB blob in RAM. Caller
@@ -964,140 +930,31 @@ fn md5_file(path: &Path) -> Result<String> {
     Ok(hex)
 }
 
-/// v0.16 — Capture the last `lines` lines from a tmux session's pane buffer.
-/// Used by the Logs tab to show the running frpc subprocess's stdout. tmux
-/// `capture-pane -p -S -<n>` pulls history; if the session doesn't exist
-/// we surface a friendly error so the UI can render a "(no session)" hint.
-pub fn tmux_capture_pane(session: &str, lines: u32) -> Result<String> {
-    use std::process::Command;
-    let n = format!("-{}", lines);
-    let out = Command::new("tmux")
-        .args(["capture-pane", "-t", session, "-p", "-S", &n])
-        .output()
-        .with_context(|| "spawn tmux capture-pane")?;
-    if !out.status.success() {
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        anyhow::bail!("tmux capture-pane failed: {}", stderr.trim());
-    }
-    Ok(String::from_utf8_lossy(&out.stdout).to_string())
-}
-
-/// v0.16 — quick scan of `latest.log` for stability events. Counts
-/// occurrences within the last ~30 minutes (heuristic: the last N lines
-/// since we don't have ms-precise timestamps without a TZ-aware parse).
-/// Drives the watchdog summary at the top of the Logs tab.
-#[derive(Debug, Default, Clone)]
-pub struct WatchdogSummary {
-    pub tick_lag_count: u32,
-    pub long_gc_count: u32,
-    pub last_event_label: Option<String>,
-}
-
-pub fn watchdog_summary(server_dir: &Path) -> WatchdogSummary {
-    let log_path = server_dir.join("logs/latest.log");
-    let lines = read_log_lines(&log_path);
-    // Window: last 4000 lines ≈ "recent". Paper logs ~10–50 lines/min when
-    // active, so this covers ~30–60 minutes of normal play.
-    let n = lines.len();
-    let take = 4000usize.min(n);
-    let start = n.saturating_sub(take);
-    summarize_log_window(&lines[start..])
-}
-
-pub fn summarize_log_window(lines: &[String]) -> WatchdogSummary {
-    let mut out = WatchdogSummary::default();
-    for line in lines {
-        if line.contains("Can't keep up!")
-            || line.contains("Server is overloaded")
-            || line.contains("Running ")
-                && line.contains("ms or ")
-                && line.contains(" ticks behind")
-        {
-            out.tick_lag_count = out.tick_lag_count.saturating_add(1);
-            out.last_event_label = Some(short_event_label(line));
-        } else if let Some(ms) = parse_long_gc_ms(line) {
-            if ms >= 500 {
-                out.long_gc_count = out.long_gc_count.saturating_add(1);
-                out.last_event_label = Some(format!("GC {}ms", ms));
-            }
-        }
-    }
-    out
-}
-
-/// Pull a `[HH:MM:SS]` prefix + a 1-line excerpt for the watchdog summary.
-fn short_event_label(line: &str) -> String {
-    // Trim line to ≤ 60 chars so the summary header stays one row.
-    let trimmed = line.trim();
-    let cap = 60.min(trimmed.len());
-    let mut s: String = trimmed.chars().take(cap).collect();
-    if trimmed.chars().count() > cap {
-        s.push('…');
-    }
-    s
-}
-
-/// Parse "...GC took NNN ms..." or "Total time NNN ms" patterns. Heuristic
-/// — we accept either Paper's watchdog or the JVM's GC log if redirected.
-pub fn parse_long_gc_ms(line: &str) -> Option<u64> {
-    // Pattern: "GC took 731 ms" — easy.
-    if let Some(idx) = line.find("GC took ") {
-        let rest = &line[idx + "GC took ".len()..];
-        let num: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
-        if !num.is_empty() {
-            if let Ok(ms) = num.parse() {
-                return Some(ms);
-            }
-        }
-    }
-    // Pattern: "Total time NNN ms" inside a JVM GC log line.
-    if let Some(idx) = line.find("Total time ") {
-        let rest = &line[idx + "Total time ".len()..];
-        let num: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
-        if !num.is_empty() {
-            if let Ok(ms) = num.parse() {
-                return Some(ms);
-            }
-        }
-    }
-    None
-}
-
 /// v0.15 — Locate a usable frpc binary. Search order:
-///   1. `frpc` on `$PATH` (Arch users via `paru -S sakura-frp`, Homebrew, etc.)
-///   2. `~/.config/mc-tui/frpc` (where mc-tui's onboarding tells users to drop it)
+///   1. `frpc` (or `frpc.exe`) on `$PATH` — Arch users via `paru -S sakura-frp`,
+///      Homebrew, manual drops into `~/.local/bin`, etc.
+///   2. shulker's per-user config dir (`~/.config/shulker/frpc` on Linux,
+///      `~/Library/Application Support/shulker/frpc` on macOS,
+///      `%APPDATA%\shulker\frpc.exe` on Windows) where the setup wizard
+///      drops the binary it downloads.
 /// Returns `None` if neither exists. We never auto-download — the user pulls
 /// the official binary themselves (no second-party redistribution, no licensing
-/// trapdoor for mc-tui).
+/// trapdoor for shulker).
 pub fn find_frpc_binary() -> Option<PathBuf> {
+    let exe_name = if cfg!(windows) { "frpc.exe" } else { "frpc" };
     if let Some(path) = std::env::var_os("PATH") {
         for dir in std::env::split_paths(&path) {
-            let candidate = dir.join("frpc");
+            let candidate = dir.join(exe_name);
             if candidate.is_file() {
                 return Some(candidate);
             }
         }
     }
-    let managed = mc_tui_config_dir().join("frpc");
+    let managed = dirs::config_dir()?.join("shulker").join(exe_name);
     if managed.is_file() {
         return Some(managed);
     }
     None
-}
-
-/// Where mc-tui keeps its own state (token, downloaded frpc, etc.). Mirror of
-/// `sys::config_dir` — duplicated here to avoid a cycle (sys depends on data
-/// types in some functions).
-fn mc_tui_config_dir() -> PathBuf {
-    if let Ok(p) = std::env::var("XDG_CONFIG_HOME") {
-        if !p.is_empty() {
-            return PathBuf::from(p).join("mc-tui");
-        }
-    }
-    if let Ok(home) = std::env::var("HOME") {
-        return PathBuf::from(home).join(".config").join("mc-tui");
-    }
-    PathBuf::from(".mc-tui")
 }
 
 /// Map Rust's runtime target triple to natfrp's download manifest keys.
@@ -1127,217 +984,6 @@ pub fn host_target_for_manifest() -> Option<(&'static str, &'static str)> {
     Some((os, arch))
 }
 
-/// True when there's a `sparkle` process owning the user's mihomo instance
-/// (Sparkle wraps mihomo on this host). The user's friend-server workflow
-/// requires Sparkle/mihomo to be killed before friends connect — long-idle TCP
-/// inside mihomo's fake-ip tunnel gets reaped at ~30s, which silently breaks
-/// the SakuraFrp ↔ Minecraft path. We surface a hint, never auto-kill.
-pub fn mihomo_running() -> bool {
-    pgrep_matches("pgrep", "sparkle")
-}
-
-/// Inner helper, factored for testability: invokes `<bin> -f <pattern>` and
-/// returns true on exit code 0 (pgrep convention = "matched at least one
-/// process"). A missing binary or any spawn failure → `false` so callers can
-/// treat the function as "is the named pattern definitely running?" without
-/// guarding against errors.
-fn pgrep_matches(bin: &str, pattern: &str) -> bool {
-    use std::process::{Command, Stdio};
-    Command::new(bin)
-        .args(["-f", pattern])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
-}
-
-pub fn detect_sakurafrp_docker(container: &str) -> SakuraFrpDocker {
-    use std::process::Command;
-    let out = Command::new("docker")
-        .args(["inspect", "--format", "{{.State.Status}}", container])
-        .output();
-    let Ok(out) = out else {
-        return SakuraFrpDocker { state: DockerState::Unknown };
-    };
-    if !out.status.success() {
-        // `docker inspect` prints "No such object" to stderr and exits 1
-        // when the container doesn't exist.
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        if stderr.contains("No such object") || stderr.contains("not found") {
-            return SakuraFrpDocker { state: DockerState::Missing };
-        }
-        return SakuraFrpDocker { state: DockerState::Unknown };
-    }
-    let status = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    SakuraFrpDocker { state: parse_docker_state(&status) }
-}
-
-/// Map `docker inspect`'s `.State.Status` string to our enum. Pure, testable.
-pub fn parse_docker_state(s: &str) -> DockerState {
-    match s.trim() {
-        "running" => DockerState::Running,
-        "" => DockerState::Unknown,
-        // created / exited / paused / restarting / dead / removing — all "not running"
-        _ => DockerState::Stopped,
-    }
-}
-
-/// v0.14 — Pull the launcher's WebUI password out of its persisted config.
-/// The natfrp.com/launcher image (v3.1.x as of 2026-05-01) keeps state at
-/// `/run/config.json` with the password in `webui_pass`. Older images may
-/// have used different paths/fields, so we try a couple of fallbacks.
-///
-/// Returns the **plaintext password** the user would type into the WebUI's
-/// login screen. The local control protocol authenticates via
-/// `HMAC-SHA256(key=password, message=server_challenge)` — see
-/// `LauncherClient` in src/natfrp.rs.
-pub fn read_launcher_password(container: &str) -> Option<String> {
-    use std::process::Command;
-    const CANDIDATE_PATHS: &[&str] = &[
-        "/run/config.json",
-        "/var/lib/natfrp-launcher/data.json",
-        "/data/data.json",
-        "/app/data.json",
-        "/root/.natfrp/data.json",
-    ];
-    for path in CANDIDATE_PATHS {
-        let out = Command::new("docker")
-            .args(["exec", container, "cat", path])
-            .output()
-            .ok()?;
-        if !out.status.success() {
-            continue;
-        }
-        let body = String::from_utf8_lossy(&out.stdout);
-        if let Some(pw) = parse_launcher_password(&body) {
-            return Some(pw);
-        }
-    }
-    None
-}
-
-/// Extract the WebUI password from the launcher's config blob. Field name
-/// has shifted across launcher releases: 3.1.x calls it `webui_pass`; older
-/// builds used `password` / `webui_password` / `WebPassword` /
-/// `WebUIPassword`. We accept any of them. `remote_management_key` is the
-/// HMAC key for the *remote* management WebSocket (rm-api.natfrp.com), not
-/// the local one — listed last as a desperate fallback only.
-pub fn parse_launcher_password(body: &str) -> Option<String> {
-    let v: serde_json::Value = serde_json::from_str(body).ok()?;
-    for key in &[
-        "webui_pass",
-        "webui_password",
-        "WebPassword",
-        "WebUIPassword",
-        "password",
-        // Last-resort fallback. The remote management key is wrong for
-        // local auth but if the launcher ever consolidates them this still
-        // returns something rather than nothing.
-        "remote_management_key",
-    ] {
-        if let Some(s) = v.get(*key).and_then(|x| x.as_str()) {
-            if !s.is_empty() {
-                return Some(s.to_string());
-            }
-        }
-    }
-    None
-}
-
-/// Read `/run/config.json::auto_start_tunnels` — the persistent list of
-/// tunnel ids the launcher boots into the "running" state. Treated as the
-/// truth source for enable/disable since the launcher's gRPC schema isn't
-/// public and the auto-start flag is the durable property anyway. Returns
-/// empty when the container isn't reachable.
-pub fn read_launcher_auto_start(container: &str) -> Vec<u64> {
-    use std::process::Command;
-    const PATH: &str = "/run/config.json";
-    let Ok(out) = Command::new("docker")
-        .args(["exec", container, "cat", PATH])
-        .output()
-    else {
-        return Vec::new();
-    };
-    if !out.status.success() {
-        return Vec::new();
-    }
-    parse_auto_start(&String::from_utf8_lossy(&out.stdout))
-}
-
-pub fn parse_auto_start(body: &str) -> Vec<u64> {
-    let Ok(v) = serde_json::from_str::<serde_json::Value>(body) else {
-        return Vec::new();
-    };
-    let Some(arr) = v.get("auto_start_tunnels").and_then(|x| x.as_array()) else {
-        return Vec::new();
-    };
-    arr.iter().filter_map(|x| x.as_u64()).collect()
-}
-
-/// Write a new `auto_start_tunnels` list back into `/run/config.json` and
-/// restart the container so the launcher picks it up. Approach: docker exec
-/// a python3 one-liner that reads the file, mutates the array, writes it
-/// back atomically (config.json.bak → config.json swap), then `docker
-/// restart`. Container restart is on the order of 10 s and matches the
-/// user's existing `pkill sparkle && docker restart natfrp-service`
-/// muscle memory.
-///
-/// Returns Err if any step fails (read, write, restart). The caller should
-/// surface this verbatim — partial state is possible if the write succeeded
-/// but the restart failed, in which case the launcher will pick up the new
-/// list on its next start.
-pub fn write_launcher_auto_start(container: &str, ids: &[u64]) -> Result<()> {
-    use std::process::Command;
-    // Build the JSON array literal, then run a python3 one-liner inside
-    // the container to update the field. python3 is more reliable than sed
-    // for editing JSON, and it's already in the official launcher image.
-    let arr_json = serde_json::to_string(ids).context("serialize ids")?;
-    let script = format!(
-        r#"import json,sys
-with open('/run/config.json','r') as f: cfg=json.load(f)
-cfg['auto_start_tunnels']={}
-with open('/run/config.json.tmp','w') as f: json.dump(cfg,f,indent=4)
-import os
-os.replace('/run/config.json.tmp','/run/config.json')
-"#,
-        arr_json
-    );
-    let out = Command::new("docker")
-        .args(["exec", "-i", container, "python3", "-c", &script])
-        .output()
-        .with_context(|| format!("docker exec python3 in {}", container))?;
-    if !out.status.success() {
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        anyhow::bail!("rewrite config.json failed: {}", stderr.trim());
-    }
-    let restart = Command::new("docker")
-        .args(["restart", container])
-        .output()
-        .with_context(|| format!("docker restart {}", container))?;
-    if !restart.status.success() {
-        let stderr = String::from_utf8_lossy(&restart.stderr);
-        anyhow::bail!("docker restart failed: {}", stderr.trim());
-    }
-    Ok(())
-}
-
-/// Run `docker <verb> <container>` synchronously and return stdout/stderr in a
-/// single Result so the caller can feed it straight to App.status.
-pub fn docker_lifecycle(verb: &str, container: &str) -> Result<String> {
-    use std::process::Command;
-    let out = Command::new("docker")
-        .args([verb, container])
-        .output()
-        .with_context(|| format!("spawn docker {}", verb))?;
-    if out.status.success() {
-        Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
-    } else {
-        let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
-        anyhow::bail!("docker {} {}: {}", verb, container, err)
-    }
-}
 
 // ---------- v0.5: backup scanner ----------
 //
@@ -1349,9 +995,12 @@ pub fn docker_lifecycle(verb: &str, container: &str) -> Result<String> {
 
 pub struct BackupEntry {
     pub name: String,
-    /// Kept for future restore action; the current draw_backups only shows name/size/age.
+    /// Kept for future restore action; the current draw_backups only shows name/age.
     #[allow(dead_code)]
     pub path: PathBuf,
+    /// v0.16 dropped per-row size from the Worlds detail panel (one world's
+    /// backups are similar size). Field kept for future "restore" UX.
+    #[allow(dead_code)]
     pub size_bytes: u64,
     pub modified: Option<chrono::DateTime<chrono::Local>>,
 }
@@ -1621,96 +1270,6 @@ pub fn list_yaml_files(server_dir: &Path) -> Vec<PathBuf> {
 mod tests {
     use super::*;
 
-    /// `/bin/false` exists on every Unix and exits 1 unconditionally. Standing
-    /// in for "pgrep ran but matched nothing" — we expect false, never a panic.
-    #[test]
-    fn pgrep_matches_returns_false_on_nonzero_exit() {
-        assert!(!pgrep_matches("/bin/false", "sparkle"));
-    }
-
-    /// A nonexistent binary path triggers a spawn error. We must return false
-    /// rather than propagate or panic — production callers treat the function
-    /// as "is the pattern definitely running?".
-    #[test]
-    fn pgrep_matches_returns_false_when_binary_missing() {
-        assert!(!pgrep_matches("/nonexistent-bin-zzzzz", "sparkle"));
-    }
-
-    /// v0.14.1 — webui_pass (the actual local-WebUI password) wins over all
-    /// fallbacks. Verified against a real natfrp.com/launcher 3.1.7 container:
-    /// HMAC-SHA256(challenge, webui_pass) successfully completes the
-    /// `ilsf-1-challenge`/`ilsf-1-response` handshake on
-    /// `/launcher/control` with subprotocol `natfrp-launcher-grpc`.
-    #[test]
-    fn parse_launcher_password_prefers_webui_pass() {
-        // 3.1.x current path
-        assert_eq!(
-            parse_launcher_password(r#"{"webui_pass":"realPW"}"#),
-            Some("realPW".to_string())
-        );
-        // Older fallbacks
-        assert_eq!(
-            parse_launcher_password(r#"{"password":"abc"}"#),
-            Some("abc".to_string())
-        );
-        assert_eq!(
-            parse_launcher_password(r#"{"webui_password":"xyz"}"#),
-            Some("xyz".to_string())
-        );
-        assert_eq!(
-            parse_launcher_password(r#"{"WebPassword":"PQR"}"#),
-            Some("PQR".to_string())
-        );
-        // Field priority: webui_pass beats anything else when present.
-        assert_eq!(
-            parse_launcher_password(
-                r#"{"remote_management_key":"K","webui_pass":"correct","password":"old"}"#
-            ),
-            Some("correct".to_string())
-        );
-        // Last-resort fallback to remote_management_key still works.
-        assert_eq!(
-            parse_launcher_password(r#"{"remote_management_key":"R"}"#),
-            Some("R".to_string())
-        );
-        // Empty string is treated as "not configured", same as missing.
-        assert_eq!(parse_launcher_password(r#"{"password":""}"#), None);
-        assert_eq!(parse_launcher_password(r#"{"foo":"bar"}"#), None);
-        assert_eq!(parse_launcher_password("nope"), None);
-    }
-
-    /// v0.16 — watchdog summary counts "Can't keep up!" and similar tick-lag
-    /// markers, plus long GC pauses. We deliberately ignore lines that mention
-    /// these strings inside chat (in vanilla, chat is `<NAME> message`).
-    #[test]
-    fn summarize_log_window_counts_watchdog_warnings() {
-        let lines: Vec<String> = vec![
-            "[20:00:00] [Server thread/WARN]: Can't keep up! Did the system time change, or is the server overloaded?".into(),
-            "[20:01:00] [Server thread/INFO]: GC took 731 ms".into(),
-            "[20:02:00] [Server thread/INFO]: Spencer joined the game".into(),
-            "[20:03:00] [Server thread/WARN]: Can't keep up! ...".into(),
-            "[20:04:00] [Server thread/INFO]: GC took 200 ms".into(), // below threshold
-        ];
-        let s = summarize_log_window(&lines);
-        assert_eq!(s.tick_lag_count, 2);
-        assert_eq!(s.long_gc_count, 1);
-        assert!(s.last_event_label.is_some());
-    }
-
-    #[test]
-    fn parse_long_gc_ms_accepts_common_shapes() {
-        assert_eq!(
-            parse_long_gc_ms("[20:01:00] [Server thread/INFO]: GC took 731 ms"),
-            Some(731)
-        );
-        assert_eq!(
-            parse_long_gc_ms("[GC pause] Total time 1450 ms — generational"),
-            Some(1450)
-        );
-        // No GC marker → None.
-        assert!(parse_long_gc_ms("just a regular log line").is_none());
-    }
-
     /// Online detection — extract player name from join/leave broadcasts.
     /// Vanilla / Paper / Purpur all emit these verbatim from the server thread.
     #[test]
@@ -1788,7 +1347,7 @@ mod tests {
     fn verify_md5_against_known_vector() {
         // RFC 1321: md5("") = d41d8cd98f00b204e9800998ecf8427e
         let dir = std::env::temp_dir().join(format!(
-            "mc-tui-md5-test-{}",
+            "shulker-md5-test-{}",
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
@@ -1830,21 +1389,5 @@ mod tests {
         // these should map to None.
     }
 
-    /// v0.14.1 — auto_start_tunnels is the source of truth for enable/disable
-    /// in the absence of a working gRPC client. Tolerate missing key / empty
-    /// list / malformed JSON without panicking; downstream UI just shows
-    /// `?` markers in those cases.
-    #[test]
-    fn parse_auto_start_handles_shapes() {
-        assert_eq!(parse_auto_start(r#"{"auto_start_tunnels":[1,2,3]}"#), vec![1, 2, 3]);
-        assert_eq!(parse_auto_start(r#"{"auto_start_tunnels":[]}"#), Vec::<u64>::new());
-        assert_eq!(parse_auto_start(r#"{}"#), Vec::<u64>::new());
-        assert_eq!(parse_auto_start("not json"), Vec::<u64>::new());
-        // Non-numeric entries (shouldn't happen but guard anyway)
-        assert_eq!(
-            parse_auto_start(r#"{"auto_start_tunnels":[1,"two",3]}"#),
-            vec![1, 3]
-        );
-    }
 }
 

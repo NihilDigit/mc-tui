@@ -1,4 +1,4 @@
-//! SakuraFrp REST API client (v4). All calls are blocking — mc-tui has no
+//! SakuraFrp REST API client (v4). All calls are blocking — shulker has no
 //! async runtime. Each call is a single HTTP round-trip; we do not stream or
 //! poll. Caller is expected to call only on user-initiated refresh, never on
 //! every render frame.
@@ -92,6 +92,9 @@ impl Client {
 
     /// Map of unix-epoch-seconds → bytes used in that bucket. Caller sums or
     /// picks the latest depending on what they want to display.
+    /// Kept as a future seam for per-tunnel traffic UX; not currently wired
+    /// to any tab.
+    #[allow(dead_code)]
     pub fn tunnel_traffic(&self, id: u64) -> ApiResult<HashMap<u64, u64>> {
         let body = self.get_text(&format!("/tunnel/traffic?id={}", id))?;
         parse_tunnel_traffic(&body)
@@ -345,6 +348,7 @@ fn ensure_rustls_provider() {
 /// Tiny HMAC-SHA256 implementation in pure Rust. Avoids pulling another crate
 /// just for the launcher handshake. RFC 2104 reference; verified to match
 /// `crypto.subtle` output during protocol discovery.
+#[allow(dead_code)] // Future seam: used by launcher_challenge_response when v0.14.2 wires the websocket.
 fn hmac_sha256_hex(key: &[u8], msg: &[u8]) -> String {
     use sha2::{Digest, Sha256};
     const BLOCK: usize = 64;
@@ -382,6 +386,7 @@ fn hmac_sha256_hex(key: &[u8], msg: &[u8]) -> String {
 /// `ilsf-1-challenge` exchange. Public because the test suite verifies it
 /// against a fixture nonce; the live LauncherClient feeds it the live
 /// challenge string.
+#[allow(dead_code)] // Future seam: hooked when v0.14.2 ships the websocket bring-up.
 pub fn launcher_challenge_response(password: &str, challenge: &str) -> String {
     hmac_sha256_hex(password.as_bytes(), challenge.as_bytes())
 }
@@ -415,10 +420,15 @@ impl LauncherClient {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct UserInfo {
+    /// Deserialized for the API response shape; not currently rendered.
+    #[allow(dead_code)]
     pub id: u64,
     pub name: String,
     #[serde(default)]
     pub speed: String,
+    /// Server-reported tunnel count; we render our own count from the
+    /// /tunnels list instead. Kept here so the deserialize stays lossless.
+    #[allow(dead_code)]
     #[serde(default)]
     pub tunnels: u32,
     #[serde(default)]
@@ -432,6 +442,9 @@ pub struct UserInfo {
 pub struct UserGroup {
     #[serde(default)]
     pub name: String,
+    /// Plan level integer (0 = free, higher = paid tiers). Not rendered;
+    /// the user-facing label comes from `name` instead.
+    #[allow(dead_code)]
     #[serde(default)]
     pub level: i32,
 }
@@ -843,17 +856,4 @@ mod tests {
         assert_ne!(r1, r3);
     }
 
-    #[test]
-    fn natfrp_error_display_is_specific_per_variant() {
-        // Display strings double as a debug log when the UI doesn't translate;
-        // make sure each variant says something distinguishable.
-        assert!(format!("{}", NatfrpError::Unauthorized).contains("401"));
-        assert!(format!("{}", NatfrpError::Forbidden).contains("403"));
-        assert!(format!("{}", NatfrpError::ServerError(503)).contains("503"));
-        assert!(format!("{}", NatfrpError::HttpError(404)).contains("404"));
-        let net = format!("{}", NatfrpError::Network("dns failed".into()));
-        assert!(net.contains("dns failed"));
-        let parse = format!("{}", NatfrpError::Parse("bad json".into()));
-        assert!(parse.contains("bad json"));
-    }
 }

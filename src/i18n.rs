@@ -230,7 +230,6 @@ pub struct Strings {
     pub sf_tunnels_empty_option_browser_b: &'static str,
     pub sf_tunnels_empty_option_launcher: &'static str,
     pub sf_action_open_dashboard: &'static str,
-    pub sf_mihomo_warning: &'static str,
     pub sf_launcher_hint: &'static str,
     pub sf_traffic_warning_high: &'static str,
     pub sf_traffic_warning_critical: &'static str,
@@ -414,7 +413,7 @@ pub const EN: Strings = Strings {
     sf_status_online: "● online",
     sf_status_offline: "○ offline",
     sf_no_selected_tunnel: "✗ Select a tunnel first.",
-    sf_token_saved: "✓ Token saved (~/.config/mc-tui/natfrp.token, 0600).",
+    sf_token_saved: "✓ Token saved (~/.config/shulker/natfrp.token, 0600).",
     sf_refreshing: "→ Fetching from api.natfrp.com…",
     sf_err_unauthorized: "✗ Token invalid or revoked — press t to paste a fresh access key.",
     sf_err_forbidden: "✗ Token lacks permissions — check the access key's permission switches in the SakuraFrp dashboard.",
@@ -427,7 +426,6 @@ pub const EN: Strings = Strings {
     sf_tunnels_empty_option_browser_b: "        → type tcp / local 127.0.0.1:25565",
     sf_tunnels_empty_option_launcher: "  • Or: create one in the launcher GUI",
     sf_action_open_dashboard: "Open natfrp.com",
-    sf_mihomo_warning: "⚠ Detected a system proxy — friends may disconnect ~30s after joining. Turn the proxy off and restart the tunnel from the Network tab.",
     sf_launcher_hint: "ℹ Tunnels are enabled but the connector isn't running — restart it from the Network tab.",
     sf_traffic_warning_high: "⚠ Traffic over 80% of plan",
     sf_traffic_warning_critical: "⚠ Traffic over 95% of plan — tunnels may stop forwarding",
@@ -609,7 +607,7 @@ pub const ZH: Strings = Strings {
     sf_status_online: "● 在线",
     sf_status_offline: "○ 离线",
     sf_no_selected_tunnel: "✗ 请先选中一个隧道。",
-    sf_token_saved: "✓ token 已保存 (~/.config/mc-tui/natfrp.token, 0600)。",
+    sf_token_saved: "✓ token 已保存 (~/.config/shulker/natfrp.token, 0600)。",
     sf_refreshing: "→ 正在请求 api.natfrp.com…",
     sf_err_unauthorized: "✗ token 无效或已过期 — 按 t 重新粘贴访问密钥。",
     sf_err_forbidden: "✗ token 权限不足 — 在 SakuraFrp 后台检查访问密钥的「权限」开关。",
@@ -622,7 +620,6 @@ pub const ZH: Strings = Strings {
     sf_tunnels_empty_option_browser_b: "        → 类型 tcp / 本地 127.0.0.1:25565",
     sf_tunnels_empty_option_launcher: "  • 或：用 launcher GUI 建",
     sf_action_open_dashboard: "打开 natfrp.com",
-    sf_mihomo_warning: "⚠ 检测到系统代理 — 朋友进来约 30 秒后可能掉线。开玩前请关掉代理，并在「网络」tab 重启转发。",
     sf_launcher_hint: "ℹ 隧道已启用但转发进程未运行 — 到「网络」tab 重启转发。",
     sf_traffic_warning_high: "⚠ 流量已用超过 80%",
     sf_traffic_warning_critical: "⚠ 流量已用超过 95% — 隧道可能停止转发",
@@ -688,12 +685,6 @@ pub fn server_action_label(lang: Lang, a: ServerAction) -> &'static str {
     }
 }
 
-pub fn fmt_status_running(lang: Lang, pid: u32) -> String {
-    match lang {
-        Lang::En => format!("● running (pid {})", pid),
-        Lang::Zh => format!("● 运行中 (pid {})", pid),
-    }
-}
 pub fn fmt_world_switched(lang: Lang, name: &str) -> String {
     match lang {
         Lang::En => format!("✓ Switched to '{}'. Restart the server to load it.", name),
@@ -808,12 +799,6 @@ pub fn fmt_kill_failed(lang: Lang, err: &str) -> String {
         Lang::Zh => format!("✗ kill 失败: {}", err),
     }
 }
-pub fn fmt_stop_sent(lang: Lang, pid: u32) -> String {
-    match lang {
-        Lang::En => format!("→ SIGTERM → pid {}. Waiting for graceful shutdown…", pid),
-        Lang::Zh => format!("→ 已发送 SIGTERM → pid {}。等待平滑停服…", pid),
-    }
-}
 pub fn fmt_log_read_error(lang: Lang, err: &str) -> String {
     match lang {
         Lang::En => format!("(read error: {})", err),
@@ -825,8 +810,8 @@ pub fn fmt_log_read_error(lang: Lang, err: &str) -> String {
 //
 // The API has been historically misclassified to the user as raw GET path errors
 // ("✗ user_info: GET /user/info"). These helpers map a typed `NatfrpError` shape
-// into actionable copy. The `Network` flavor in particular hints at the user's
-// own mihomo workflow, since that's the most common cause we've seen.
+// into actionable copy. The `Network` flavor in particular hints at "disable
+// any system proxy", since that's the most common cause we've seen.
 
 pub fn fmt_sf_err_server(lang: Lang, code: u16) -> String {
     match lang {

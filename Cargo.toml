@@ -1,5 +1,5 @@
 [package]
-name = "mc-tui"
+name = "shulker"
 version = "0.1.0"
 edition = "2024"
 description = "TUI manager for a Minecraft Paper/Purpur server"
@@ -31,6 +31,21 @@ ureq = { version = "2", default-features = false, features = ["tls", "json"] }
 # cert verification is security-equivalent to a one-shot pin.
 rustls = "0.23"
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+# v0.17 — cross-platform stack. dirs picks the OS-native config dir
+# (Linux ~/.config, macOS ~/Library/Application Support, Windows %APPDATA%).
+# arboard replaces the wl-copy shell-out — pure Rust, no X11 C deps; the
+# wayland-data-control feature gives native Wayland support. webbrowser
+# replaces xdg-open. if-addrs replaces parsing `ip -4 -o addr show`.
+dirs = "6"
+arboard = { version = "3", default-features = false, features = ["wayland-data-control"] }
+webbrowser = "1"
+if-addrs = "0.13"
+# v0.17 — Windows server console = ConPTY via portable-pty (wezterm).
+# Unix uses tmux directly so we only pull this dep on Windows. portable-pty
+# also abstracts Unix PTY but our Linux/macOS path keeps the existing tmux
+# UX (attach-from-another-terminal, persistent across shulker restarts).
+[target.'cfg(windows)'.dependencies]
+portable-pty = "0.9"
 
 [profile.release]
 lto = "thin"
