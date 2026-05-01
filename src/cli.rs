@@ -64,6 +64,11 @@ pub enum Cmd {
         /// 0-based index of the row to highlight (for detail-panel QA).
         #[arg(long, default_value_t = 0)]
         select: usize,
+        /// v0.13 — open the node picker overlay before rendering. Values:
+        /// `create` (CreateTunnel purpose) | `migrate` (MigrateTunnel purpose).
+        /// Useful for QA-ing the picker without building a write-side flow.
+        #[arg(long)]
+        picker: Option<String>,
     },
 }
 

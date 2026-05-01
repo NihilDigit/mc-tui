@@ -276,9 +276,17 @@ Tracked here instead of GitHub issues for now. Mark with date when shipped; keep
 - [x] Sparkle/mihomo presence detector (`mihomo_running()` via `pgrep -f sparkle`); dim warning line on tab when running. Never auto-kills.
 - [x] Traffic plan % usage with ≥80% yellow / ≥95% red color gradient; launcher-down hint surfaced on the actions row when applicable.
 
+### v0.13 — SakuraFrp tunnel write operations (shipped 2026-05-01)
+
+- [x] `Client::create_tunnel` / `migrate_tunnel` / `delete_tunnels` over `application/x-www-form-urlencoded` (SakuraFrp v4 expects forms, not JSON).
+- [x] Full-screen node picker overlay; game-friendly nodes float to top, then VIP ascending. Esc cancels, Enter picks. `c` opens picker with `CreateTunnel` purpose; `m` with `MigrateTunnel`.
+- [x] Three-step create flow: name → node picker → port. Default name = `mc_<server-dir-slug>` (hyphens normalized to `_`); `validate_tunnel_name` mirrors server-side rules (alnum + `_`, ≤32 chars).
+- [x] `d` on SakuraFrp tab fires a confirm prompt that requires typing the tunnel name verbatim (not just "yes") — extra friction for ADHD users with `d`-press muscle memory from the Players tab.
+- [x] Non-game-friendly node selection appends a dim warning to status (long-idle TCP can drop after ~30s).
+- [x] `screenshot --picker create|migrate` for QA without firing destructive ops.
+
 ### Backlog (no version yet)
 
-- [ ] v0.13 — write operations against `/tunnels` (create / migrate / delete) and node picker UI.
 - [ ] v0.14 — single-tunnel lifecycle via the launcher's WebUI on port 7102 (HTTPS, self-signed).
 - [ ] Backup restore action (with confirmation prompt + extract into a sibling dir, never overwrite the live world).
 - [ ] More YAML schema awareness for `paper-global.yml` (right-side panel showing what each key does, mirrored from upstream docs).

@@ -143,6 +143,60 @@ enum PromptAction {
     SetSakuraFrpContainer,
     /// v0.10 — input the SakuraFrp API token. Persisted to natfrp.token (0600).
     SetNatfrpToken,
+    // v0.13 — three-step tunnel-create flow. Each step pre-fills sensible
+    // defaults; on confirm, the next step opens automatically. Cancelling any
+    // step aborts the whole flow without touching the API.
+    CreateTunnelName,
+    CreateTunnelPort {
+        name: String,
+        node: u64,
+    },
+    /// v0.13 — destructive ops require typing the tunnel name as confirmation.
+    /// We don't accept a generic "yes" because the user has multiple tabs
+    /// where `d` does something irreversible (Players' purge); typing the
+    /// actual name forces them to look at what they're about to break.
+    ConfirmDeleteTunnel {
+        id: u64,
+        name: String,
+    },
+}
+
+#[derive(Debug, Clone, Default)]
+struct CreateTunnelDraft {
+    pub name: String,
+    pub node: Option<u64>,
+}
+
+/// v0.13 — the node picker is a full-screen overlay, not its own tab. It's
+/// `Some` while the picker is up; main.rs's key handler routes Up/Down/Enter
+/// to it instead of the underlying tab. Esc closes without selecting.
+#[derive(Debug, Clone)]
+struct NodePickerState {
+    pub purpose: NodePickerPurpose,
+    pub list_state: ListState,
+    /// Cached, sorted list of (node_id, label) pairs. Computed once when the
+    /// picker opens so navigation is stable even if the underlying nodes map
+    /// is re-fetched.
+    pub entries: Vec<NodePickerEntry>,
+}
+
+#[derive(Debug, Clone)]
+struct NodePickerEntry {
+    pub node_id: u64,
+    pub name: String,
+    pub description: String,
+    pub vip: u32,
+    pub is_game: bool,
+    pub host_present: bool,
+}
+
+#[derive(Debug, Clone)]
+enum NodePickerPurpose {
+    /// User is on step 2 of the create flow; we already have the name and the
+    /// next prompt is the port.
+    CreateTunnel { name: String },
+    /// User is migrating an existing tunnel onto a new node.
+    MigrateTunnel { tunnel_id: u64, tunnel_name: String },
 }
 
 struct App {
@@ -212,6 +266,14 @@ struct App {
     // is off-limits.
     pub mihomo_running: bool,
 
+    // v0.13 — full-screen node picker overlay. `Some` while the user is in the
+    // create-tunnel-step-2 or migrate-tunnel flows; key events route to the
+    // overlay instead of the underlying tab. None means no picker active.
+    pub node_picker: Option<NodePickerState>,
+    /// In-progress create draft. Built up across the three create steps so we
+    /// can roll back cleanly if the user cancels mid-flow.
+    pub create_tunnel_draft: Option<CreateTunnelDraft>,
+
     pub status: String,
     pub prompt: Option<InputPrompt>,
 
@@ -271,6 +333,8 @@ impl App {
             natfrp_state: ListState::default(),
             natfrp_loaded: false,
             mihomo_running: false,
+            node_picker: None,
+            create_tunnel_draft: None,
             status: match lang {
                 Lang::En => String::from("Ready."),
                 Lang::Zh => String::from("就绪。"),
@@ -605,6 +669,280 @@ impl App {
             (Lang::Zh, true) => format!("✓ 已复制 {} 到剪贴板", addr),
             (Lang::Zh, false) => format!("ℹ {}（wl-copy 不可用）", addr),
         };
+    }
+
+    // ---------- v0.13: tunnel write operations ----------
+
+    /// Build the default `mc_<slug>` tunnel name for the current server-dir.
+    /// `server_dir_slug` uses `-` for non-alnum chars but SakuraFrp rejects
+    /// hyphens, so we re-normalize to `_` here.
+    fn default_tunnel_name(&self) -> String {
+        let slug = sys::server_dir_slug(&self.server_dir).replace('-', "_");
+        format!("mc_{}", slug)
+    }
+
+    /// Step 1 of create flow: prompt for the tunnel name.
+    fn start_create_tunnel(&mut self) {
+        let s = self.lang.s();
+        self.create_tunnel_draft = Some(CreateTunnelDraft::default());
+        self.prompt = Some(InputPrompt {
+            title: s.sf_prompt_create_name_title.into(),
+            label: s.sf_prompt_create_name_label.into(),
+            buffer: self.default_tunnel_name(),
+            action: PromptAction::CreateTunnelName,
+        });
+    }
+
+    /// Step 1 confirmed → validate, store name in draft, open node picker.
+    fn handle_create_tunnel_name(&mut self, raw_name: &str) -> Result<()> {
+        let name = raw_name.trim().to_string();
+        if !natfrp::validate_tunnel_name(&name) {
+            self.status = match self.lang {
+                Lang::En => format!(
+                    "✗ Invalid tunnel name '{}' — only A-Z a-z 0-9 _ allowed (≤32 chars).",
+                    raw_name
+                ),
+                Lang::Zh => format!(
+                    "✗ 隧道名 '{}' 不合法 — 只允许字母数字下划线（≤32 字符）。",
+                    raw_name
+                ),
+            };
+            self.create_tunnel_draft = None;
+            return Ok(());
+        }
+        if let Some(d) = self.create_tunnel_draft.as_mut() {
+            d.name = name.clone();
+        }
+        self.open_node_picker(NodePickerPurpose::CreateTunnel { name });
+        Ok(())
+    }
+
+    /// Step 2 picker selected → store node id, prompt for port.
+    fn handle_create_tunnel_node(&mut self, node: u64, name: String) {
+        let s = self.lang.s();
+        if let Some(d) = self.create_tunnel_draft.as_mut() {
+            d.node = Some(node);
+        }
+        self.prompt = Some(InputPrompt {
+            title: s.sf_prompt_create_port_title.into(),
+            label: s.sf_prompt_create_port_label.into(),
+            buffer: "25565".to_string(),
+            action: PromptAction::CreateTunnelPort { name, node },
+        });
+    }
+
+    /// Step 3 confirmed → validate port, fire POST, refresh, select new tunnel.
+    fn handle_create_tunnel_port(&mut self, raw: &str, name: &str, node: u64) {
+        let port: u16 = match raw.trim().parse() {
+            Ok(n) if n != 0 => n,
+            _ => {
+                self.status = match self.lang {
+                    Lang::En => format!("✗ Invalid port '{}'", raw),
+                    Lang::Zh => format!("✗ 端口 '{}' 不合法", raw),
+                };
+                return;
+            }
+        };
+        let Some(token) = self.natfrp_token.clone() else {
+            self.status = self.lang.s().sf_user_no_token.to_string();
+            return;
+        };
+        let client = natfrp::Client::new(token);
+        match client.create_tunnel(name, node, port) {
+            Ok(_id) => {
+                self.status = match self.lang {
+                    Lang::En => format!("✓ Created tunnel {} on node #{}.", name, node),
+                    Lang::Zh => format!("✓ 已创建隧道 {}，节点 #{}。", name, node),
+                };
+                self.create_tunnel_draft = None;
+                // Refresh tunnels list and try to select the freshly added one.
+                self.natfrp_loaded = false;
+                self.refresh_natfrp();
+                if let Some(i) = self
+                    .natfrp_tunnels
+                    .iter()
+                    .position(|t| t.name == name)
+                {
+                    self.natfrp_state.select(Some(i));
+                }
+            }
+            Err(e) => {
+                self.status = translate_natfrp_error(self.lang, &e);
+                self.create_tunnel_draft = None;
+            }
+        }
+    }
+
+    /// `m` pressed on a tunnel row → open node picker for migration.
+    fn start_migrate_tunnel(&mut self) {
+        let Some(idx) = self.natfrp_state.selected() else {
+            self.status = self.lang.s().sf_no_selected_tunnel.to_string();
+            return;
+        };
+        let Some(t) = self.natfrp_tunnels.get(idx) else {
+            self.status = self.lang.s().sf_no_selected_tunnel.to_string();
+            return;
+        };
+        let purpose = NodePickerPurpose::MigrateTunnel {
+            tunnel_id: t.id,
+            tunnel_name: t.name.clone(),
+        };
+        self.open_node_picker(purpose);
+    }
+
+    /// Migration node selected → fire POST, refresh.
+    fn handle_migrate_node(&mut self, tunnel_id: u64, tunnel_name: &str, new_node: u64) {
+        let Some(token) = self.natfrp_token.clone() else {
+            self.status = self.lang.s().sf_user_no_token.to_string();
+            return;
+        };
+        let client = natfrp::Client::new(token);
+        match client.migrate_tunnel(tunnel_id, new_node) {
+            Ok(()) => {
+                self.status = match self.lang {
+                    Lang::En => format!(
+                        "✓ Migrated {} to node #{}. If clients can't connect, restart the launcher container from the Server tab.",
+                        tunnel_name, new_node
+                    ),
+                    Lang::Zh => format!(
+                        "✓ 已将 {} 迁移到节点 #{}。如果客户端连不上，请到运维 tab 重启 SakuraFrp 容器。",
+                        tunnel_name, new_node
+                    ),
+                };
+                self.natfrp_loaded = false;
+                self.refresh_natfrp();
+            }
+            Err(e) => {
+                self.status = translate_natfrp_error(self.lang, &e);
+            }
+        }
+    }
+
+    /// `d` pressed on a tunnel row → confirmation prompt; user must type the
+    /// tunnel name to proceed.
+    fn start_delete_tunnel(&mut self) {
+        let Some(idx) = self.natfrp_state.selected() else {
+            self.status = self.lang.s().sf_no_selected_tunnel.to_string();
+            return;
+        };
+        let Some(t) = self.natfrp_tunnels.get(idx) else {
+            self.status = self.lang.s().sf_no_selected_tunnel.to_string();
+            return;
+        };
+        let title = match self.lang {
+            Lang::En => format!("DELETE tunnel '{}' (id {}) — type the name to confirm", t.name, t.id),
+            Lang::Zh => format!("删除隧道 '{}' (id {}) — 输入名称以确认", t.name, t.id),
+        };
+        self.prompt = Some(InputPrompt {
+            title,
+            label: self.lang.s().sf_prompt_create_name_label.into(),
+            buffer: String::new(),
+            action: PromptAction::ConfirmDeleteTunnel {
+                id: t.id,
+                name: t.name.clone(),
+            },
+        });
+    }
+
+    /// Confirmation prompt resolved → if input matches name, fire POST.
+    fn handle_confirm_delete_tunnel(&mut self, raw: &str, id: u64, name: &str) {
+        if raw.trim() != name {
+            self.status = match self.lang {
+                Lang::En => format!("✗ Confirmation mismatch — expected '{}'. Aborted.", name),
+                Lang::Zh => format!("✗ 确认输入不匹配 — 期望 '{}'。已取消。", name),
+            };
+            return;
+        }
+        let Some(token) = self.natfrp_token.clone() else {
+            self.status = self.lang.s().sf_user_no_token.to_string();
+            return;
+        };
+        let client = natfrp::Client::new(token);
+        match client.delete_tunnels(&[id]) {
+            Ok(()) => {
+                self.status = match self.lang {
+                    Lang::En => format!("✓ Deleted tunnel '{}' (id {}).", name, id),
+                    Lang::Zh => format!("✓ 已删除隧道 '{}' (id {})。", name, id),
+                };
+                self.natfrp_loaded = false;
+                self.refresh_natfrp();
+                if self.natfrp_state.selected().is_some() && self.natfrp_tunnels.is_empty() {
+                    self.natfrp_state.select(None);
+                }
+            }
+            Err(e) => {
+                self.status = translate_natfrp_error(self.lang, &e);
+            }
+        }
+    }
+
+    /// Build a sorted node-picker entries list from the current `/nodes`
+    /// cache. Game-friendly nodes go first, then by VIP tier ascending
+    /// (lowest = available to most users), then by id for stable ordering.
+    fn open_node_picker(&mut self, purpose: NodePickerPurpose) {
+        let mut entries: Vec<NodePickerEntry> = self
+            .natfrp_nodes
+            .iter()
+            .map(|(id, n)| NodePickerEntry {
+                node_id: *id,
+                name: n.name.clone(),
+                description: n.description.clone(),
+                vip: n.vip,
+                is_game: natfrp::is_game_node(n),
+                host_present: !n.host.is_empty(),
+            })
+            .collect();
+        entries.sort_by(|a, b| {
+            // Game-friendly first (true > false → reverse boolean compare)
+            b.is_game
+                .cmp(&a.is_game)
+                .then(a.vip.cmp(&b.vip))
+                .then(a.node_id.cmp(&b.node_id))
+        });
+        let mut list_state = ListState::default();
+        if !entries.is_empty() {
+            list_state.select(Some(0));
+        }
+        self.node_picker = Some(NodePickerState {
+            purpose,
+            list_state,
+            entries,
+        });
+    }
+
+    /// Picker confirmed (Enter pressed inside overlay).
+    fn handle_node_picker_select(&mut self) {
+        let Some(picker) = self.node_picker.take() else {
+            return;
+        };
+        let Some(idx) = picker.list_state.selected() else {
+            return;
+        };
+        let Some(entry) = picker.entries.get(idx) else {
+            return;
+        };
+        let node_id = entry.node_id;
+        // Plan §6: nag once when the user picks a non-game-friendly node, since
+        // that's the original "宁波 30秒掉线" failure mode. We don't block the
+        // pick — they may have a reason (regional latency, paid plan, etc.).
+        let warn_non_game = !entry.is_game;
+        match picker.purpose {
+            NodePickerPurpose::CreateTunnel { name } => {
+                self.handle_create_tunnel_node(node_id, name);
+            }
+            NodePickerPurpose::MigrateTunnel {
+                tunnel_id,
+                tunnel_name,
+            } => {
+                self.handle_migrate_node(tunnel_id, &tunnel_name, node_id);
+            }
+        }
+        if warn_non_game {
+            // Append rather than replace — the success/failure status the
+            // handler set is more important; the warning is supplemental.
+            let warn = self.lang.s().sf_picker_warn_non_game;
+            self.status = format!("{}  {}", self.status, warn);
+        }
     }
 
     fn cycle_tab(&mut self, dir: isize) {
@@ -1545,6 +1883,15 @@ fn run<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<()> {
                         PromptAction::SetSakuraFrpAddress => app.set_sakurafrp_address(&value)?,
                         PromptAction::SetSakuraFrpContainer => app.set_sakurafrp_container(&value)?,
                         PromptAction::SetNatfrpToken => app.set_natfrp_token(&value)?,
+                        PromptAction::CreateTunnelName => {
+                            app.handle_create_tunnel_name(&value)?
+                        }
+                        PromptAction::CreateTunnelPort { name, node } => {
+                            app.handle_create_tunnel_port(&value, &name, node)
+                        }
+                        PromptAction::ConfirmDeleteTunnel { id, name } => {
+                            app.handle_confirm_delete_tunnel(&value, id, &name)
+                        }
                     }
                 }
                 KeyCode::Backspace => {
@@ -1558,6 +1905,43 @@ fn run<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<()> {
                 _ => {
                     app.prompt = Some(prompt);
                 }
+            }
+            continue;
+        }
+
+        // v0.13 — node picker overlay intercepts input. Only nav + confirm +
+        // cancel go through; everything else (including tab-switch / quit
+        // shortcuts) is silently dropped so the user can't accidentally
+        // navigate away mid-create. Esc closes the overlay without selecting.
+        if app.node_picker.is_some() {
+            match key.code {
+                KeyCode::Esc => {
+                    app.node_picker = None;
+                    app.create_tunnel_draft = None;
+                    app.status = app.lang.s().cancelled.into();
+                }
+                KeyCode::Up => {
+                    if let Some(p) = app.node_picker.as_mut() {
+                        let n = p.entries.len();
+                        if n > 0 {
+                            let cur = p.list_state.selected().unwrap_or(0) as isize;
+                            let new = (cur - 1).rem_euclid(n as isize) as usize;
+                            p.list_state.select(Some(new));
+                        }
+                    }
+                }
+                KeyCode::Down => {
+                    if let Some(p) = app.node_picker.as_mut() {
+                        let n = p.entries.len();
+                        if n > 0 {
+                            let cur = p.list_state.selected().unwrap_or(0) as isize;
+                            let new = (cur + 1).rem_euclid(n as isize) as usize;
+                            p.list_state.select(Some(new));
+                        }
+                    }
+                }
+                KeyCode::Enter => app.handle_node_picker_select(),
+                _ => {}
             }
             continue;
         }
@@ -1664,10 +2048,16 @@ fn run<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<()> {
                     });
                 }
             }
-            KeyCode::Char('d') => {
-                if app.tab == TabId::Players {
-                    app.remove_selected_player()?;
-                }
+            KeyCode::Char('d') => match app.tab {
+                TabId::Players => app.remove_selected_player()?,
+                TabId::SakuraFrp => app.start_delete_tunnel(),
+                _ => {}
+            },
+            KeyCode::Char('c') if app.tab == TabId::SakuraFrp => {
+                app.start_create_tunnel();
+            }
+            KeyCode::Char('m') if app.tab == TabId::SakuraFrp => {
+                app.start_migrate_tunnel();
             }
             KeyCode::Char('o') => match app.tab {
                 TabId::Players => app.toggle_op_for_selected()?,
@@ -1918,9 +2308,18 @@ fn main() -> Result<()> {
             height,
             lang,
             select,
+            picker,
         }) => {
             let server_dir = resolve_server_dir(cli.server_dir.clone())?;
-            return render_screenshot(&server_dir, &tab, width, height, &lang, select);
+            return render_screenshot(
+                &server_dir,
+                &tab,
+                width,
+                height,
+                &lang,
+                select,
+                picker.as_deref(),
+            );
         }
         Some(Cmd::Run) | None => {}
     }
@@ -1981,6 +2380,7 @@ fn render_screenshot(
     height: u16,
     lang: &str,
     select: usize,
+    picker: Option<&str>,
 ) -> Result<()> {
     use ratatui::backend::TestBackend;
     let lang = Lang::from_code(lang);
@@ -2008,6 +2408,28 @@ fn render_screenshot(
         let idx = select.min(len - 1);
         let t = app.tab;
         app.list_state_for(t).select(Some(idx));
+    }
+    // v0.13 picker QA: open the node picker before rendering so its layout
+    // can be inspected without firing destructive ops.
+    if let Some(kind) = picker {
+        let purpose = match kind.to_ascii_lowercase().as_str() {
+            "create" => NodePickerPurpose::CreateTunnel {
+                name: app.default_tunnel_name(),
+            },
+            "migrate" => {
+                let (id, name) = app
+                    .natfrp_tunnels
+                    .first()
+                    .map(|t| (t.id, t.name.clone()))
+                    .unwrap_or((0, "—".to_string()));
+                NodePickerPurpose::MigrateTunnel {
+                    tunnel_id: id,
+                    tunnel_name: name,
+                }
+            }
+            other => anyhow::bail!("unknown picker kind: {}", other),
+        };
+        app.open_node_picker(purpose);
     }
     let backend = TestBackend::new(width, height);
     let mut terminal = Terminal::new(backend)?;
@@ -2245,6 +2667,58 @@ mod tests {
         assert!(en.contains("running"));
         assert!(zh.contains("运行中"));
         assert!(en.contains("42") && zh.contains("42"));
+    }
+
+    /// v0.13 — node picker sort: game-friendly first, then VIP ascending,
+    /// then id ascending. Important: a user with `vip=0` should see free
+    /// nodes before paid ones, otherwise they pick a node they can't use.
+    #[test]
+    fn node_picker_sorts_game_then_vip_then_id() {
+        use natfrp::Node;
+        let mk = |id: u64, vip: u32, desc: &str| Node {
+            name: format!("n{}", id),
+            host: "h".into(),
+            description: desc.into(),
+            flag: 0,
+            vip,
+        };
+        // Build a faux nodes map and sort it the way `open_node_picker` does.
+        let nodes: HashMap<u64, Node> = HashMap::from([
+            (10, mk(10, 1, "")),                  // non-game, vip 1
+            (20, mk(20, 0, "")),                  // non-game, vip 0
+            (30, mk(30, 0, "游戏专用")),          // game, vip 0
+            (40, mk(40, 2, "Minecraft optimized")), // game, vip 2
+            (50, mk(50, 0, "Game server")),       // game, vip 0 (later id)
+        ]);
+        let mut entries: Vec<(u64, bool, u32)> = nodes
+            .iter()
+            .map(|(id, n)| (*id, natfrp::is_game_node(n), n.vip))
+            .collect();
+        entries.sort_by(|a, b| {
+            b.1.cmp(&a.1).then(a.2.cmp(&b.2)).then(a.0.cmp(&b.0))
+        });
+        let order: Vec<u64> = entries.into_iter().map(|(id, _, _)| id).collect();
+        // Expected: [30 (game,0), 50 (game,0), 40 (game,2), 20 (non,0), 10 (non,1)]
+        assert_eq!(order, vec![30, 50, 40, 20, 10]);
+    }
+
+    /// Default tunnel name normalizes hyphens (server_dir_slug uses `-` for
+    /// non-alnum chars, but SakuraFrp rejects hyphens). The result must always
+    /// pass validate_tunnel_name.
+    #[test]
+    fn default_tunnel_name_passes_validation() {
+        use natfrp::validate_tunnel_name;
+        // Simulate: server-dir basename → slug → mc_<slug-with-hyphens-replaced>
+        let slug = sys::server_dir_slug(std::path::Path::new("/srv/My Cool Server"));
+        let normalized = format!("mc_{}", slug.replace('-', "_"));
+        assert!(
+            validate_tunnel_name(&normalized),
+            "default name '{}' must pass server validation",
+            normalized
+        );
+        // Plain alnum slug should also work.
+        let slug = sys::server_dir_slug(std::path::Path::new("/srv/mcserver"));
+        assert!(validate_tunnel_name(&format!("mc_{}", slug.replace('-', "_"))));
     }
 
     /// v0.12 — every NatfrpError variant maps to a distinct, language-appropriate

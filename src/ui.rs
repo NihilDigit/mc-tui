@@ -20,7 +20,9 @@ use crate::i18n::{
     fmt_log_read_error, fmt_status_running, hint_for, property_metadata, property_zh,
     server_action_label, tab_name, Lang, Strings,
 };
-use crate::{App, InputPrompt, TabId, YamlView, SERVER_ACTIONS, TABS};
+use crate::{
+    App, InputPrompt, NodePickerPurpose, NodePickerState, TabId, YamlView, SERVER_ACTIONS, TABS,
+};
 
 pub fn ui(f: &mut Frame, app: &mut App) {
     // Compact chrome: header + tabs each take a single line (no border boxes).
@@ -52,9 +54,117 @@ pub fn ui(f: &mut Frame, app: &mut App) {
     }
     draw_hints(f, chunks[3], app);
 
+    // v0.13 — node picker overlays the entire frame above the tab content.
+    // Drawn after the tab so it takes visual priority; key handling routes
+    // here too. Drawn before prompts so a confirm dialog can stack on top
+    // (currently no flow does this, but the layering is intentional).
+    if app.node_picker.is_some() {
+        draw_node_picker(f, app);
+    }
+
     if let Some(prompt) = app.prompt.clone() {
         draw_prompt(f, &prompt, app.lang);
     }
+}
+
+/// Full-screen node picker overlay. Game-friendly nodes float to the top;
+/// the user navigates with ↑/↓ and confirms with Enter.
+fn draw_node_picker(f: &mut Frame, app: &mut App) {
+    let s = app.lang.s();
+    let area = f.area();
+    f.render_widget(ratatui::widgets::Clear, area);
+
+    let Some(picker) = app.node_picker.as_mut() else {
+        return;
+    };
+
+    let title: &str = match &picker.purpose {
+        NodePickerPurpose::CreateTunnel { .. } => s.sf_picker_title_create,
+        NodePickerPurpose::MigrateTunnel { .. } => s.sf_picker_title_migrate,
+    };
+
+    // Top: 2-line legend; middle: list; bottom: 1-line hint.
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(2),
+            Constraint::Min(3),
+            Constraint::Length(1),
+        ])
+        .split(area);
+
+    let legend = Paragraph::new(vec![
+        Line::from(Span::styled(
+            format!(" {}", s.sf_picker_legend_game),
+            Style::default().fg(Color::Yellow),
+        )),
+        Line::from(Span::styled(
+            format!(" {}", s.sf_picker_legend_vip),
+            Style::default().fg(Color::DarkGray),
+        )),
+    ]);
+    f.render_widget(legend, chunks[0]);
+
+    let items: Vec<ListItem> = if picker.entries.is_empty() {
+        vec![ListItem::new(Line::from(Span::styled(
+            s.sf_picker_no_nodes,
+            Style::default().fg(Color::DarkGray),
+        )))]
+    } else {
+        picker
+            .entries
+            .iter()
+            .map(|e| {
+                let star = if e.is_game { "★" } else { " " };
+                let star_color = if e.is_game { Color::Yellow } else { Color::DarkGray };
+                let host_marker = if e.host_present { " " } else { "·" };
+                let name_color = if e.is_game { Color::White } else { Color::Gray };
+                let truncated_desc = truncate_display(&e.description, 40);
+                ListItem::new(Line::from(vec![
+                    Span::styled(format!(" {} ", star), Style::default().fg(star_color)),
+                    Span::styled(
+                        format!("#{:<5}", e.node_id),
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                    Span::raw(" "),
+                    Span::styled(
+                        format!("{}{:<28}", host_marker, truncate_display(&e.name, 28)),
+                        Style::default().fg(name_color).add_modifier(Modifier::BOLD),
+                    ),
+                    Span::raw(" "),
+                    Span::styled(
+                        format!("VIP{:<2}", e.vip),
+                        Style::default().fg(if e.vip == 0 {
+                            Color::Green
+                        } else {
+                            Color::Magenta
+                        }),
+                    ),
+                    Span::raw("  "),
+                    Span::styled(truncated_desc, Style::default().fg(Color::DarkGray)),
+                ]))
+            })
+            .collect()
+    };
+
+    let list = List::new(items)
+        .block(Block::default().borders(Borders::ALL).title(title))
+        .highlight_style(Style::default().bg(Color::Blue).add_modifier(Modifier::BOLD))
+        .highlight_symbol("> ");
+    f.render_stateful_widget(list, chunks[1], &mut picker.list_state);
+
+    let hint = Paragraph::new(Line::from(vec![Span::styled(
+        format!(" {}", s.sf_picker_hint),
+        Style::default().fg(Color::DarkGray),
+    )]));
+    f.render_widget(hint, chunks[2]);
+}
+
+/// Helper used by main.rs's mouse handler to test whether the picker is up;
+/// kept here so ratatui-specific types stay in this module.
+#[allow(dead_code)]
+pub fn picker_is_open(state: &Option<NodePickerState>) -> bool {
+    state.is_some()
 }
 
 /// One-line header: status + level + dir + primary connect chip.

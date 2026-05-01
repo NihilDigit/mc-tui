@@ -227,6 +227,22 @@ pub struct Strings {
     pub sf_launcher_hint: &'static str,
     pub sf_traffic_warning_high: &'static str,
     pub sf_traffic_warning_critical: &'static str,
+
+    // v0.13 — write operations
+    pub sf_action_create: &'static str,
+    pub sf_action_migrate: &'static str,
+    pub sf_action_delete: &'static str,
+    pub sf_prompt_create_name_title: &'static str,
+    pub sf_prompt_create_name_label: &'static str,
+    pub sf_prompt_create_port_title: &'static str,
+    pub sf_prompt_create_port_label: &'static str,
+    pub sf_picker_title_create: &'static str,
+    pub sf_picker_title_migrate: &'static str,
+    pub sf_picker_hint: &'static str,
+    pub sf_picker_legend_game: &'static str,
+    pub sf_picker_legend_vip: &'static str,
+    pub sf_picker_no_nodes: &'static str,
+    pub sf_picker_warn_non_game: &'static str,
 }
 
 pub const EN: Strings = Strings {
@@ -361,7 +377,7 @@ pub const EN: Strings = Strings {
     title_sakurafrp_user: " User ",
     title_sakurafrp_tunnels: " Tunnels ",
     title_sakurafrp_actions: " Actions ",
-    hint_sakurafrp: "↑/↓ select   Enter copy address   t set token   o open natfrp.com   r refresh   q quit",
+    hint_sakurafrp: "↑/↓ sel  Enter copy  t token  o open  c create  m migrate  d delete  r refresh  q quit",
     sf_user_no_token: "(no token set — pick \"Set token\" below to enter one)",
     sf_user_loading: "(loading…)",
     sf_user_token_label: "token",
@@ -400,6 +416,20 @@ pub const EN: Strings = Strings {
     sf_launcher_hint: "ℹ Tunnel detected but launcher container is not running — switch to the Server tab to start it.",
     sf_traffic_warning_high: "⚠ Traffic over 80% of plan",
     sf_traffic_warning_critical: "⚠ Traffic over 95% of plan — tunnels may stop forwarding",
+    sf_action_create: "Create tunnel",
+    sf_action_migrate: "Migrate selected tunnel",
+    sf_action_delete: "Delete selected tunnel",
+    sf_prompt_create_name_title: "Tunnel name (alphanumeric + underscore, ≤32)",
+    sf_prompt_create_name_label: "name",
+    sf_prompt_create_port_title: "Local port (the Minecraft server's listening port)",
+    sf_prompt_create_port_label: "port",
+    sf_picker_title_create: " Pick a node for the new tunnel ",
+    sf_picker_title_migrate: " Pick a node to migrate to ",
+    sf_picker_hint: "↑/↓ select   Enter pick   Esc cancel",
+    sf_picker_legend_game: "★ = game-friendly (stays open under long idle)",
+    sf_picker_legend_vip: "VIP = required tier; 0 = open to all",
+    sf_picker_no_nodes: "(no nodes — refresh on the SakuraFrp tab first with r)",
+    sf_picker_warn_non_game: "⚠ Not flagged game-friendly — long-idle TCP may drop after ~30s.",
 };
 
 pub const ZH: Strings = Strings {
@@ -534,7 +564,7 @@ pub const ZH: Strings = Strings {
     title_sakurafrp_user: " 账户 ",
     title_sakurafrp_tunnels: " 隧道 ",
     title_sakurafrp_actions: " 操作 ",
-    hint_sakurafrp: "↑/↓ 选择   Enter 复制公网地址   t 设置 token   o 打开 natfrp.com   r 刷新   q 退出",
+    hint_sakurafrp: "↑/↓ 选  Enter 复制  t token  o 打开  c 创建  m 迁移  d 删除  r 刷新  q 退出",
     sf_user_no_token: "(未设置 token — 在下方选「设置 token」录入)",
     sf_user_loading: "(加载中…)",
     sf_user_token_label: "token",
@@ -573,6 +603,20 @@ pub const ZH: Strings = Strings {
     sf_launcher_hint: "ℹ 检测到隧道但 launcher 容器未运行 — 切到「运维」tab 启动。",
     sf_traffic_warning_high: "⚠ 流量已用超过 80%",
     sf_traffic_warning_critical: "⚠ 流量已用超过 95% — 隧道可能停止转发",
+    sf_action_create: "创建隧道",
+    sf_action_migrate: "迁移选中隧道",
+    sf_action_delete: "删除选中隧道",
+    sf_prompt_create_name_title: "隧道名（字母数字下划线，≤32 字符）",
+    sf_prompt_create_name_label: "名称",
+    sf_prompt_create_port_title: "本地端口（Minecraft 服务器监听的端口）",
+    sf_prompt_create_port_label: "端口",
+    sf_picker_title_create: " 为新隧道选节点 ",
+    sf_picker_title_migrate: " 选择迁移目标节点 ",
+    sf_picker_hint: "↑/↓ 选择   Enter 确认   Esc 取消",
+    sf_picker_legend_game: "★ = 游戏专用（长 idle 不掉线）",
+    sf_picker_legend_vip: "VIP = 所需会员等级；0 = 全员可用",
+    sf_picker_no_nodes: "(暂无节点 — 请先在 SakuraFrp tab 按 r 刷新)",
+    sf_picker_warn_non_game: "⚠ 非游戏专用节点 — 长 idle TCP 可能 30 秒后断开。",
 };
 
 // Parametric messages — return owned Strings.

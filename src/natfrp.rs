@@ -96,6 +96,83 @@ impl Client {
         let body = self.get_text(&format!("/tunnel/traffic?id={}", id))?;
         parse_tunnel_traffic(&body)
     }
+
+    // ---------- v0.13 write operations ----------
+    //
+    // SakuraFrp v4 expects `application/x-www-form-urlencoded` on writes (NOT
+    // JSON). Empty/optional fields are omitted entirely so the server's
+    // defaults kick in (most importantly `remote=""` → server-allocated public
+    // port). The post_form helper centralizes the auth header + error mapping
+    // so each verb stays a one-liner.
+    //
+    // ⚠ These have NOT been smoke-tested against the live API on this
+    // machine yet (the user's only existing tunnel is production). When you
+    // first invoke them in a real session, watch the response carefully —
+    // SakuraFrp's POST replies are not always shaped like the GET responses,
+    // and serde deserialization may need tweaking.
+
+    fn post_form(&self, path: &str, params: &[(&str, &str)]) -> ApiResult<String> {
+        let url = format!("{}{}", API_BASE, path);
+        let resp = self
+            .agent
+            .post(&url)
+            .set("Authorization", &format!("Bearer {}", self.token))
+            .send_form(params)
+            .map_err(classify_ureq_error)?;
+        resp.into_string()
+            .map_err(|e| NatfrpError::Network(e.to_string()))
+    }
+
+    /// Create a new tcp tunnel. Returns the new tunnel's id when the API
+    /// gives one back; otherwise `None` and the caller should `tunnels()`
+    /// to find the freshly-added entry.
+    pub fn create_tunnel(
+        &self,
+        name: &str,
+        node: u64,
+        local_port: u16,
+    ) -> ApiResult<Option<u64>> {
+        let node_str = node.to_string();
+        let port_str = local_port.to_string();
+        let params: &[(&str, &str)] = &[
+            ("name", name),
+            ("type", "tcp"),
+            ("node", &node_str),
+            ("local_ip", "127.0.0.1"),
+            ("local_port", &port_str),
+            // `remote` deliberately omitted → SakuraFrp auto-assigns a public port.
+        ];
+        let body = self.post_form("/tunnels", params)?;
+        Ok(parse_create_tunnel_id(&body))
+    }
+
+    /// Move an existing tunnel onto a new node. Public address changes after
+    /// migrate (the host follows the node), so the caller should refresh
+    /// `tunnels()` before reading the address.
+    pub fn migrate_tunnel(&self, id: u64, node: u64) -> ApiResult<()> {
+        let id_str = id.to_string();
+        let node_str = node.to_string();
+        let params: &[(&str, &str)] = &[("id", &id_str), ("node", &node_str)];
+        self.post_form("/tunnel/migrate", params)?;
+        Ok(())
+    }
+
+    /// Delete one or more tunnels. SakuraFrp accepts up to 10 ids in one call,
+    /// comma-separated. Caller is expected to confirm with the user before
+    /// invoking — there's no undo.
+    pub fn delete_tunnels(&self, ids: &[u64]) -> ApiResult<()> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+        let joined = ids
+            .iter()
+            .map(|i| i.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        let params: &[(&str, &str)] = &[("ids", &joined)];
+        self.post_form("/tunnel/delete", params)?;
+        Ok(())
+    }
 }
 
 /// Map a ureq::Error to our typed enum. ureq splits errors into Status (HTTP
@@ -167,6 +244,11 @@ pub struct Node {
     /// nodes by looking at the description string for now.
     #[serde(default)]
     pub flag: u32,
+    /// VIP tier required to use this node. 0 = open to everyone. v0.13's node
+    /// picker uses this as the secondary sort key (so users see nodes they
+    /// can actually pick before locked-out higher-tier ones).
+    #[serde(default)]
+    pub vip: u32,
 }
 
 pub fn parse_user_info(body: &str) -> ApiResult<UserInfo> {
@@ -202,6 +284,49 @@ pub fn parse_tunnel_traffic(body: &str) -> ApiResult<HashMap<u64, u64>> {
         out.insert(ts, v);
     }
     Ok(out)
+}
+
+/// Best-effort id extractor for the `POST /tunnels` response body. The shape
+/// isn't documented and may differ between SakuraFrp versions — we look for a
+/// numeric `id` field in either a top-level object or a top-level
+/// `{ "data": { "id": ... } }` envelope. On miss we return `None` so the
+/// caller can fall back to a `tunnels()` refresh + name lookup.
+pub fn parse_create_tunnel_id(body: &str) -> Option<u64> {
+    let v: serde_json::Value = serde_json::from_str(body).ok()?;
+    if let Some(id) = v.get("id").and_then(|x| x.as_u64()) {
+        return Some(id);
+    }
+    if let Some(id) = v.pointer("/data/id").and_then(|x| x.as_u64()) {
+        return Some(id);
+    }
+    None
+}
+
+/// SakuraFrp tunnel names are constrained server-side to ASCII alphanumerics +
+/// underscore (no dashes!). Pre-validate so the user gets immediate feedback
+/// instead of a delayed API rejection.
+pub fn validate_tunnel_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 32
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// "Is this node tagged as game-friendly?" — drives the v0.13 picker's primary
+/// sort. The signal is whatever the SakuraFrp operator wrote into the node's
+/// description; matching is intentionally loose (CN/EN markers + the bare
+/// substring "MC") because the upstream doesn't expose a typed flag.
+pub fn is_game_node(node: &Node) -> bool {
+    let d = node.description.to_ascii_lowercase();
+    node.description.contains("游戏专用")
+        || node.description.contains("游戏")
+        || d.contains("game")
+        || d.contains("minecraft")
+        || d.contains(" mc ")
+        || d.starts_with("mc ")
+        || d.ends_with(" mc")
+        || d == "mc"
 }
 
 /// Public address for a tunnel, suitable for the join bar / clipboard.
@@ -354,6 +479,66 @@ mod tests {
             NatfrpError::Parse(_) => {}
             other => panic!("expected Parse, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn validate_tunnel_name_accepts_alnum_underscore_only() {
+        assert!(validate_tunnel_name("mc_fuchenling"));
+        assert!(validate_tunnel_name("server1"));
+        assert!(validate_tunnel_name("a"));
+        assert!(validate_tunnel_name("ABC_123"));
+    }
+
+    #[test]
+    fn validate_tunnel_name_rejects_invalid_input() {
+        assert!(!validate_tunnel_name("")); // empty
+        assert!(!validate_tunnel_name("mc-fuchenling")); // hyphen — server rejects
+        assert!(!validate_tunnel_name("server name")); // space
+        assert!(!validate_tunnel_name("中文")); // non-ascii
+        assert!(!validate_tunnel_name(&"a".repeat(33))); // overlong
+    }
+
+    #[test]
+    fn is_game_node_picks_up_common_markers() {
+        let mk = |desc: &str| Node {
+            name: "n".into(),
+            host: "h".into(),
+            description: desc.into(),
+            flag: 0,
+            vip: 0,
+        };
+        assert!(is_game_node(&mk("游戏专用")));
+        assert!(is_game_node(&mk("CN-华北 游戏专用 BGP")));
+        assert!(is_game_node(&mk("Minecraft optimized")));
+        assert!(is_game_node(&mk("GAME node")));
+        assert!(is_game_node(&mk("mc")));
+        assert!(!is_game_node(&mk("普通节点 BGP")));
+        assert!(!is_game_node(&mk(""))); // empty desc → not game
+    }
+
+    #[test]
+    fn parse_create_tunnel_id_handles_envelope_shapes() {
+        // Top-level id
+        assert_eq!(parse_create_tunnel_id(r#"{"id":42}"#), Some(42));
+        // Wrapped in data
+        assert_eq!(
+            parse_create_tunnel_id(r#"{"code":0,"data":{"id":99}}"#),
+            Some(99)
+        );
+        // Missing → None (caller falls back to tunnels())
+        assert_eq!(parse_create_tunnel_id(r#"{"ok":true}"#), None);
+        // Garbage → None, no panic
+        assert_eq!(parse_create_tunnel_id("not json"), None);
+    }
+
+    /// Sanity check: a node payload with `vip` populated round-trips through
+    /// serde without losing the field. v0.13 picker sorts by this and
+    /// silently broke would surface as "wrong order" rather than a parse error.
+    #[test]
+    fn parses_node_with_vip_field() {
+        let body = r#"{"218":{"name":"test","host":"h","description":"游戏专用","vip":3,"flag":44}}"#;
+        let ns = parse_nodes(body).unwrap();
+        assert_eq!(ns.get(&218).unwrap().vip, 3);
     }
 
     #[test]
