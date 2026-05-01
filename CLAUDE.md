@@ -132,10 +132,11 @@ src/
 ├── cli.rs     Cli + Cmd + ServerType + scaffold_new + Java/curl/Aikar/first-boot helpers.
 ├── data.rs    Data structs + filesystem / network IO (worlds, whitelist, ops, properties, backups, YAML walker, NIC discovery, sticky pid detection).
 ├── i18n.rs    Lang + Strings struct + EN/ZH consts + fmt_* parametric helpers + property_zh annotations + PropertyMeta lookup table.
-├── sys.rs     state.toml persistence, tmux session helpers, POSIX shell quote, path/tilde helpers.
+├── natfrp.rs  Blocking REST client for api.natfrp.com/v4 (UserInfo / Tunnel / Node) + parse helpers — feeds the SakuraFrp tab.
+├── sys.rs     state.toml + natfrp.token (0600) persistence, tmux session helpers, POSIX shell quote, path/tilde helpers.
 └── ui.rs      Every ratatui draw_* function + ui() dispatcher + layout helpers.
 
-Cargo.toml     Deps: ratatui, crossterm, clap, serde, serde_json, serde_yaml, md-5, chrono, sysinfo, unicode-width.
+Cargo.toml     Deps: ratatui, crossterm, clap, serde, serde_json, serde_yaml, md-5, chrono, sysinfo, unicode-width, ureq.
 .github/workflows/release.yml   Tag-triggered release builds for 6 targets.
 ```
 
@@ -145,7 +146,7 @@ Module dependency rule: **ui ← app/main ← {i18n, data, sys, cli}**. UI reads
 
 ```bash
 cargo run -- --server-dir /path/to/your/server
-cargo test       # 46 unit tests across all modules
+cargo test       # 55 unit tests across all modules
 cargo build --release
 ```
 
@@ -243,8 +244,29 @@ Tracked here instead of GitHub issues for now. Mark with date when shipped; keep
 - [x] README one-liner pointing at the raw scripts on the `main` branch.
 - [ ] **`git tag v0.7.0 && git push --tags`** — triggers `.github/workflows/release.yml`, which builds 6 archives and creates the GH release. Run this when you're ready; mc-tui doesn't auto-push.
 
+### v0.8 — SakuraFrp join-bar (shipped 2026-05-01)
+
+- [x] Persist `sakurafrp_address` in `state.toml`; surface as a chip in the join-bar with click-to-copy.
+
+### v0.9 — SakuraFrp launcher container (shipped 2026-05-01)
+
+- [x] Probe the `natfrp-service` Docker container via `docker inspect`; surface state marker (●/○/✗/?) on the SakuraFrp join-bar row.
+- [x] Server-tab actions: start / stop / restart / show-logs for the launcher container.
+- [x] Drop the dedicated ZeroTier classification — fold `zt*` into the generic VPN/TUN bucket.
+
+### v0.10 — SakuraFrp REST API (shipped 2026-05-01)
+
+- [x] Blocking `ureq`-based client for `api.natfrp.com/v4` (`/user/info`, `/tunnels`, `/nodes`, `/tunnel/traffic`).
+- [x] New `9 SakuraFrp` tab: user header (name / token / plan / traffic) + tunnels list (id / name / node / type / public address) + actions hint.
+- [x] Token stored at `~/.config/mc-tui/natfrp.token` (`0600`); never written to logs or `state.toml`.
+- [x] Server-tab join-bar SakuraFrp row prefers the API-derived public address; falls back to the v0.8 manual `sakurafrp_address` when the token is unset.
+- [x] `Enter` on a tunnel row copies its `host:port` to the clipboard via `wl-copy`; `t` opens the token prompt; `r` re-fetches.
+- [x] API never fires from `refresh_all()`; only on first SakuraFrp tab visit and explicit `r`.
+
 ### Backlog (no version yet)
 
+- [ ] v0.11 — write operations against `/tunnels` (create / migrate / delete) and node picker UI.
+- [ ] v0.12 — single-tunnel lifecycle via the launcher's WebUI on port 7102 (HTTPS, self-signed).
 - [ ] Backup restore action (with confirmation prompt + extract into a sibling dir, never overwrite the live world).
 - [ ] More YAML schema awareness for `paper-global.yml` (right-side panel showing what each key does, mirrored from upstream docs).
 

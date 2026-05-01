@@ -27,6 +27,38 @@ pub fn state_path() -> PathBuf {
     config_dir().join("state.toml")
 }
 
+// ---------- SakuraFrp API token ----------
+//
+// Stored separate from state.toml because it's a user credential bound to the
+// account, not to the server-dir, and should be readable only by the owner.
+
+pub fn natfrp_token_path() -> PathBuf {
+    config_dir().join("natfrp.token")
+}
+
+pub fn read_natfrp_token() -> Option<String> {
+    let raw = fs::read_to_string(natfrp_token_path()).ok()?;
+    let s = raw.trim().to_string();
+    if s.is_empty() { None } else { Some(s) }
+}
+
+pub fn write_natfrp_token(token: &str) -> Result<()> {
+    let path = natfrp_token_path();
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).ok();
+    }
+    fs::write(&path, token.trim())
+        .with_context(|| format!("write {}", path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = fs::metadata(&path)?.permissions();
+        perms.set_mode(0o600);
+        fs::set_permissions(&path, perms)?;
+    }
+    Ok(())
+}
+
 #[derive(Debug, Default, Clone)]
 pub struct PersistedState {
     pub server_dir: Option<PathBuf>,

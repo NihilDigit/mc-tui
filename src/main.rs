@@ -3,6 +3,7 @@
 mod cli;
 mod data;
 mod i18n;
+mod natfrp;
 mod sys;
 mod ui;
 use cli::*;
@@ -12,6 +13,7 @@ use sys::*;
 use ui::ui;
 
 use std::{
+    collections::HashMap,
     fs,
     io,
     path::{Path, PathBuf},
@@ -45,7 +47,7 @@ use serde::{Deserialize, Serialize};
 // ---------- App state ----------
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TabId {
+pub enum TabId {
     Worlds,
     Whitelist,
     Ops,
@@ -54,6 +56,7 @@ enum TabId {
     Yaml,
     Backups,
     Server,
+    SakuraFrp,
 }
 
 const TABS: &[(TabId, &str)] = &[
@@ -65,6 +68,7 @@ const TABS: &[(TabId, &str)] = &[
     (TabId::Yaml, "YAML"),
     (TabId::Backups, "Backups"),
     (TabId::Server, "Server"),
+    (TabId::SakuraFrp, "SakuraFrp"),
 ];
 
 /// Server-tab actions (v0.6). Stable order — index used in events / tests.
@@ -138,6 +142,8 @@ enum PromptAction {
     PreGenChunkRadius,
     SetSakuraFrpAddress,
     SetSakuraFrpContainer,
+    /// v0.10 — input the SakuraFrp API token. Persisted to natfrp.token (0600).
+    SetNatfrpToken,
 }
 
 struct App {
@@ -182,6 +188,20 @@ struct App {
     // last-probed state.
     pub sakurafrp_container: String,
     pub sakurafrp_docker: SakuraFrpDocker,
+
+    // v0.10 — SakuraFrp API integration. Token is read from
+    // ~/.config/mc-tui/natfrp.token (0600); other fields are populated by
+    // refresh_natfrp() on demand (first tab visit + user-triggered refresh).
+    // We never call the API from refresh_all() — would block the redraw loop.
+    pub natfrp_token: Option<String>,
+    pub natfrp_user: Option<natfrp::UserInfo>,
+    pub natfrp_tunnels: Vec<natfrp::Tunnel>,
+    pub natfrp_nodes: HashMap<u64, natfrp::Node>,
+    pub natfrp_last_error: Option<String>,
+    pub natfrp_state: ListState,
+    /// True after the first refresh_natfrp() in this session — gates auto-load
+    /// on first tab visit so we don't keep re-firing requests.
+    pub natfrp_loaded: bool,
 
     pub status: String,
     pub prompt: Option<InputPrompt>,
@@ -233,6 +253,13 @@ impl App {
                 .sakurafrp_container
                 .unwrap_or_else(|| DEFAULT_SAKURAFRP_CONTAINER.to_string()),
             sakurafrp_docker: SakuraFrpDocker::default(),
+            natfrp_token: read_natfrp_token(),
+            natfrp_user: None,
+            natfrp_tunnels: Vec::new(),
+            natfrp_nodes: HashMap::new(),
+            natfrp_last_error: None,
+            natfrp_state: ListState::default(),
+            natfrp_loaded: false,
             status: match lang {
                 Lang::En => String::from("Ready."),
                 Lang::Zh => String::from("就绪。"),
@@ -320,6 +347,7 @@ impl App {
             },
             TabId::Backups => &mut self.backups_state,
             TabId::Server => &mut self.server_state,
+            TabId::SakuraFrp => &mut self.natfrp_state,
         }
     }
 
@@ -336,6 +364,7 @@ impl App {
             },
             TabId::Backups => self.backups.len(),
             TabId::Server => SERVER_ACTIONS.len(),
+            TabId::SakuraFrp => self.natfrp_tunnels.len(),
         }
     }
 
@@ -353,6 +382,134 @@ impl App {
 
     fn switch_tab(&mut self, tab: TabId) {
         self.tab = tab;
+        // Lazy-load SakuraFrp data the first time the user opens that tab.
+        // Subsequent refreshes are user-driven via 'r' to keep the network
+        // off the hot redraw path.
+        if tab == TabId::SakuraFrp && !self.natfrp_loaded && self.natfrp_token.is_some() {
+            self.refresh_natfrp();
+        }
+    }
+
+    /// Hits api.natfrp.com for /user/info + /tunnels + /nodes. Blocking — only
+    /// call from user-initiated paths (tab open, `r`). Errors land in
+    /// `natfrp_last_error`; partial success is allowed (e.g. user info loads
+    /// but tunnels fail) so the UI shows what it can.
+    fn refresh_natfrp(&mut self) {
+        let Some(token) = self.natfrp_token.clone() else {
+            self.natfrp_last_error = Some(self.lang.s().sf_user_no_token.to_string());
+            return;
+        };
+        self.status = self.lang.s().sf_refreshing.to_string();
+        self.natfrp_loaded = true;
+        let client = natfrp::Client::new(token);
+
+        let mut errors: Vec<String> = Vec::new();
+        match client.user_info() {
+            Ok(u) => self.natfrp_user = Some(u),
+            Err(e) => errors.push(format!("user_info: {}", e)),
+        }
+        match client.tunnels() {
+            Ok(ts) => {
+                self.natfrp_tunnels = ts;
+                if self.natfrp_state.selected().is_none() && !self.natfrp_tunnels.is_empty() {
+                    self.natfrp_state.select(Some(0));
+                }
+            }
+            Err(e) => errors.push(format!("tunnels: {}", e)),
+        }
+        // Only fetch /nodes once per session — the list rarely changes.
+        if self.natfrp_nodes.is_empty() {
+            match client.nodes() {
+                Ok(n) => self.natfrp_nodes = n,
+                Err(e) => errors.push(format!("nodes: {}", e)),
+            }
+        }
+
+        if errors.is_empty() {
+            self.natfrp_last_error = None;
+            self.status = self.lang.s().refreshed.to_string();
+        } else {
+            self.natfrp_last_error = Some(errors.join("; "));
+            self.status = match self.lang {
+                Lang::En => format!("✗ SakuraFrp: {}", errors.join("; ")),
+                Lang::Zh => format!("✗ SakuraFrp 出错: {}", errors.join("; ")),
+            };
+        }
+    }
+
+    fn set_natfrp_token(&mut self, token: &str) -> Result<()> {
+        let token = token.trim().to_string();
+        if token.is_empty() {
+            // Treat empty input as "clear the token".
+            let path = sys::natfrp_token_path();
+            let _ = std::fs::remove_file(&path);
+            self.natfrp_token = None;
+            self.natfrp_user = None;
+            self.natfrp_tunnels.clear();
+            self.natfrp_loaded = false;
+            self.natfrp_last_error = None;
+            self.status = match self.lang {
+                Lang::En => "✓ SakuraFrp token cleared.".into(),
+                Lang::Zh => "✓ 已清除 SakuraFrp token。".into(),
+            };
+            return Ok(());
+        }
+        write_natfrp_token(&token).context("write natfrp.token")?;
+        self.natfrp_token = Some(token);
+        self.status = self.lang.s().sf_token_saved.to_string();
+        // Force a full refresh now that we have credentials.
+        self.natfrp_loaded = false;
+        self.natfrp_user = None;
+        self.natfrp_tunnels.clear();
+        self.refresh_natfrp();
+        Ok(())
+    }
+
+    /// Public address derived from API state — first online tcp tunnel wins.
+    /// Falls back to the user-set `sakurafrp_address` from state.toml so the
+    /// pre-v0.10 manual workflow still works when the user has no token.
+    pub fn effective_sakurafrp_address(&self) -> Option<String> {
+        for t in &self.natfrp_tunnels {
+            if t.kind == "tcp" {
+                if let Some(addr) = natfrp::public_address(t, &self.natfrp_nodes) {
+                    return Some(addr);
+                }
+            }
+        }
+        self.sakurafrp_address.clone()
+    }
+
+    fn copy_selected_tunnel_address(&mut self) {
+        let s = self.lang.s();
+        let Some(idx) = self.natfrp_state.selected() else {
+            self.status = s.sf_no_selected_tunnel.to_string();
+            return;
+        };
+        let Some(t) = self.natfrp_tunnels.get(idx) else {
+            self.status = s.sf_no_selected_tunnel.to_string();
+            return;
+        };
+        let Some(addr) = natfrp::public_address(t, &self.natfrp_nodes) else {
+            self.status = match self.lang {
+                Lang::En => format!("✗ Cannot resolve public address for tunnel #{}", t.id),
+                Lang::Zh => format!("✗ 无法解析隧道 #{} 的公网地址", t.id),
+            };
+            return;
+        };
+        let copied = std::process::Command::new("wl-copy")
+            .arg(&addr)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        self.status = match (self.lang, copied) {
+            (Lang::En, true) => format!("✓ Copied {} to clipboard", addr),
+            (Lang::En, false) => format!("ℹ {} (wl-copy unavailable)", addr),
+            (Lang::Zh, true) => format!("✓ 已复制 {} 到剪贴板", addr),
+            (Lang::Zh, false) => format!("ℹ {}（wl-copy 不可用）", addr),
+        };
     }
 
     fn cycle_tab(&mut self, dir: isize) {
@@ -1208,6 +1365,7 @@ fn run<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<()> {
                         PromptAction::PreGenChunkRadius => app.pregen_chunks(&value)?,
                         PromptAction::SetSakuraFrpAddress => app.set_sakurafrp_address(&value)?,
                         PromptAction::SetSakuraFrpContainer => app.set_sakurafrp_container(&value)?,
+                        PromptAction::SetNatfrpToken => app.set_natfrp_token(&value)?,
                     }
                 }
                 KeyCode::Backspace => {
@@ -1245,11 +1403,16 @@ fn run<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<()> {
             KeyCode::Char('6') => app.switch_tab(TabId::Yaml),
             KeyCode::Char('7') => app.switch_tab(TabId::Backups),
             KeyCode::Char('8') => app.switch_tab(TabId::Server),
+            KeyCode::Char('9') => app.switch_tab(TabId::SakuraFrp),
             KeyCode::Tab => app.cycle_tab(1),
             KeyCode::BackTab => app.cycle_tab(-1),
             KeyCode::Char('r') => {
                 app.refresh_all();
-                app.status = app.lang.s().refreshed.into();
+                if app.tab == TabId::SakuraFrp {
+                    app.refresh_natfrp();
+                } else {
+                    app.status = app.lang.s().refreshed.into();
+                }
             }
             KeyCode::Up => app.move_selection(-1),
             KeyCode::Down => app.move_selection(1),
@@ -1308,6 +1471,7 @@ fn run<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<()> {
                         }
                     }
                 }
+                TabId::SakuraFrp => app.copy_selected_tunnel_address(),
                 _ => {}
             },
             KeyCode::Char('a') => match app.tab {
@@ -1369,6 +1533,15 @@ fn run<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<()> {
                     label: s.prompt_label_path.into(),
                     buffer: app.server_dir.display().to_string(),
                     action: PromptAction::ChangeServerDir,
+                });
+            }
+            KeyCode::Char('t') if app.tab == TabId::SakuraFrp => {
+                let s = app.lang.s();
+                app.prompt = Some(InputPrompt {
+                    title: s.sf_prompt_token_title.into(),
+                    label: s.sf_prompt_token_label.into(),
+                    buffer: String::new(),
+                    action: PromptAction::SetNatfrpToken,
                 });
             }
             _ => {}
@@ -1627,8 +1800,15 @@ fn render_screenshot(
         "yaml" => TabId::Yaml,
         "backups" => TabId::Backups,
         "server" => TabId::Server,
+        "sakurafrp" | "frp" | "natfrp" => TabId::SakuraFrp,
         other => anyhow::bail!("unknown tab: {}", other),
     };
+    // SakuraFrp tab fetches from the network on first visit. The screenshot
+    // path bypasses switch_tab(), so trigger refresh_natfrp() explicitly here
+    // — gives QA the same content the user would see after entering the tab.
+    if app.tab == TabId::SakuraFrp && app.natfrp_token.is_some() {
+        app.refresh_natfrp();
+    }
     // Allow QA to highlight a specific row to inspect its detail panel.
     let len = app.list_len_for(app.tab);
     if len > 0 {
@@ -2287,5 +2467,41 @@ players:
         assert!(!rect_contains(r, 9, 20));
         assert!(!rect_contains(r, 40, 20));
         assert!(!rect_contains(r, 10, 25));
+    }
+
+    #[test]
+    fn natfrp_token_roundtrip_with_0600_perms() {
+        let dir = tempdir();
+        // Pin XDG_CONFIG_HOME so write/read use a sandboxed path under our tempdir.
+        // SAFETY: Rust 2024 set_var requires unsafe — single-threaded test, no
+        // concurrent env access here.
+        let key = "XDG_CONFIG_HOME";
+        let prev = std::env::var(key).ok();
+        unsafe { std::env::set_var(key, &dir); }
+
+        write_natfrp_token("hello-token-123").unwrap();
+        let path = natfrp_token_path();
+        assert!(path.starts_with(&dir));
+        assert_eq!(read_natfrp_token().as_deref(), Some("hello-token-123"));
+
+        // 0600
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "want 0600, got {:o}", mode);
+        }
+
+        // empty file → None
+        fs::write(&path, "   ").unwrap();
+        assert!(read_natfrp_token().is_none());
+
+        // restore env
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var(key, v),
+                None => std::env::remove_var(key),
+            }
+        }
     }
 }

@@ -49,6 +49,7 @@ pub fn ui(f: &mut Frame, app: &mut App) {
         TabId::Yaml => draw_yaml(f, chunks[2], app),
         TabId::Backups => draw_backups(f, chunks[2], app),
         TabId::Server => draw_server(f, chunks[2], app),
+        TabId::SakuraFrp => draw_sakurafrp(f, chunks[2], app),
     }
     draw_hints(f, chunks[3], app);
 
@@ -631,7 +632,8 @@ fn draw_server(f: &mut Frame, area: Rect, app: &mut App) {
     // Vertical split: top = join info (auto-sized to # of interfaces + optional
     // SakuraFrp row, capped), bottom = actions list.
     let nics = detect_interfaces();
-    let frp_extra: u16 = if app.sakurafrp_address.is_some() { 1 } else { 0 };
+    let frp_addr = app.effective_sakurafrp_address();
+    let frp_extra: u16 = if frp_addr.is_some() { 1 } else { 0 };
     let join_h = (nics.len() as u16 + frp_extra + 2).max(3).min(13); // border(2) + lines
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -684,7 +686,7 @@ fn draw_join_info(f: &mut Frame, area: Rect, app: &mut App, nics: &[NicInfo]) {
     // assigned, not server.properties' server-port. Click → wl-copy. The
     // bracketed kind label also embeds a Docker state marker (●/○/✗/?) so the
     // user can see at a glance whether the launcher container is up.
-    if let Some(addr) = app.sakurafrp_address.clone() {
+    if let Some(addr) = app.effective_sakurafrp_address() {
         let (state_marker, state_color) = match app.sakurafrp_docker.state {
             DockerState::Running => ("●", Color::Green),
             DockerState::Stopped => ("○", Color::Yellow),
@@ -774,6 +776,264 @@ fn draw_server_actions(f: &mut Frame, area: Rect, app: &mut App) {
     // border title here — Server tab uses two stacked blocks ("Join addresses"
     // + "Actions") and the tab name in the tab bar already conveys context.
     let _ = s.title_server;
+}
+
+fn draw_sakurafrp(f: &mut Frame, area: Rect, app: &mut App) {
+    let s = app.lang.s();
+
+    // Top: 4-line "User" panel (border + 2 content lines + slack).
+    // Middle: tunnel list, takes whatever's left.
+    // Bottom: actions hint (3 lines, last token-state line included).
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(4),
+            Constraint::Min(3),
+            Constraint::Length(3),
+        ])
+        .split(area);
+
+    draw_sakurafrp_user(f, chunks[0], app);
+    draw_sakurafrp_tunnels(f, chunks[1], app);
+    draw_sakurafrp_actions_hint(f, chunks[2], app);
+    let _ = s; // referenced through nested fns
+}
+
+fn draw_sakurafrp_user(f: &mut Frame, area: Rect, app: &App) {
+    let s = app.lang.s();
+    let lines: Vec<Line> = if app.natfrp_token.is_none() {
+        vec![Line::from(Span::styled(
+            s.sf_user_no_token,
+            Style::default().fg(Color::DarkGray),
+        ))]
+    } else if let Some(u) = &app.natfrp_user {
+        let token_disp = app
+            .natfrp_token
+            .as_deref()
+            .map(crate::natfrp::redact_token)
+            .unwrap_or_default();
+        let traffic_line = if u.traffic.len() == 2 {
+            format!(
+                "{}: {} / {}  ({})",
+                s.sf_user_traffic_label,
+                crate::natfrp::fmt_bytes(u.traffic[0]),
+                crate::natfrp::fmt_bytes(u.traffic[1]),
+                u.speed,
+            )
+        } else {
+            format!("{}: ({})", s.sf_user_traffic_label, u.speed)
+        };
+        vec![
+            Line::from(vec![
+                Span::styled(
+                    format!(" {} ", u.name),
+                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!("{}: {}", s.sf_user_token_label, token_disp),
+                    Style::default().fg(Color::DarkGray),
+                ),
+                Span::raw("   "),
+                Span::styled(
+                    format!("{}: {}", s.sf_user_plan_label, u.group.name),
+                    Style::default().fg(Color::White),
+                ),
+            ]),
+            Line::from(vec![
+                Span::raw(" "),
+                Span::styled(traffic_line, Style::default().fg(Color::White)),
+            ]),
+        ]
+    } else if let Some(err) = &app.natfrp_last_error {
+        vec![Line::from(Span::styled(
+            format!(" ✗ {}", err),
+            Style::default().fg(Color::Red),
+        ))]
+    } else {
+        vec![Line::from(Span::styled(
+            s.sf_user_loading,
+            Style::default().fg(Color::DarkGray),
+        ))]
+    };
+
+    let p = Paragraph::new(lines).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(s.title_sakurafrp_user),
+    );
+    f.render_widget(p, area);
+}
+
+fn draw_sakurafrp_tunnels(f: &mut Frame, area: Rect, app: &mut App) {
+    let s = app.lang.s();
+    if app.natfrp_token.is_none() || (app.natfrp_tunnels.is_empty() && !app.natfrp_loaded) {
+        let msg = if app.natfrp_token.is_none() {
+            s.sf_user_no_token
+        } else {
+            s.sf_tunnels_loading
+        };
+        let p = Paragraph::new(Line::from(Span::styled(
+            msg,
+            Style::default().fg(Color::DarkGray),
+        )))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(s.title_sakurafrp_tunnels),
+        );
+        f.render_widget(p, area);
+        return;
+    }
+    if app.natfrp_tunnels.is_empty() {
+        let p = Paragraph::new(Line::from(Span::styled(
+            s.sf_tunnels_none,
+            Style::default().fg(Color::DarkGray),
+        )))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(s.title_sakurafrp_tunnels),
+        );
+        f.render_widget(p, area);
+        return;
+    }
+
+    // Column widths chosen for the common case (10-char id, 16-char tunnel
+    // name, 28-char node label, 4-char type, public address rest). On narrow
+    // terminals ratatui will truncate naturally.
+    let header = Line::from(vec![
+        Span::raw("  "),
+        Span::styled(
+            format!("{:<10}", s.sf_col_id),
+            Style::default().fg(Color::DarkGray),
+        ),
+        Span::raw(" "),
+        Span::styled(
+            format!("{:<18}", s.sf_col_name),
+            Style::default().fg(Color::DarkGray),
+        ),
+        Span::raw(" "),
+        Span::styled(
+            format!("{:<28}", s.sf_col_node),
+            Style::default().fg(Color::DarkGray),
+        ),
+        Span::raw(" "),
+        Span::styled(
+            format!("{:<5}", s.sf_col_type),
+            Style::default().fg(Color::DarkGray),
+        ),
+        Span::raw(" "),
+        Span::styled(s.sf_col_address, Style::default().fg(Color::DarkGray)),
+    ]);
+
+    let nodes = &app.natfrp_nodes;
+    let items: Vec<ListItem> = std::iter::once(ListItem::new(header))
+        .chain(app.natfrp_tunnels.iter().map(|t| {
+            let node_label = crate::natfrp::node_label(t.node, nodes);
+            let addr = crate::natfrp::public_address(t, nodes).unwrap_or_else(|| "—".to_string());
+            let online_marker = if t.online { "●" } else { "○" };
+            let online_color = if t.online { Color::Green } else { Color::DarkGray };
+            ListItem::new(Line::from(vec![
+                Span::styled(
+                    format!("{} ", online_marker),
+                    Style::default().fg(online_color),
+                ),
+                Span::styled(
+                    format!("{:<10}", t.id),
+                    Style::default().fg(Color::White),
+                ),
+                Span::raw(" "),
+                Span::styled(
+                    format!("{:<18}", truncate_display(&t.name, 18)),
+                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(" "),
+                Span::styled(
+                    format!("{:<28}", truncate_display(&node_label, 28)),
+                    Style::default().fg(Color::White),
+                ),
+                Span::raw(" "),
+                Span::styled(
+                    format!("{:<5}", t.kind),
+                    Style::default().fg(Color::Magenta),
+                ),
+                Span::raw(" "),
+                Span::styled(
+                    addr,
+                    Style::default()
+                        .fg(Color::Magenta)
+                        .add_modifier(Modifier::BOLD),
+                ),
+            ]))
+        }))
+        .collect();
+
+    // Selection state in the App is indexed against `natfrp_tunnels`; we render
+    // a header row at index 0 plus tunnels at index 1+. So we shadow `app.natfrp_state`
+    // with a temporary state shifted by +1 for the duration of this render.
+    let mut shifted = app.natfrp_state.clone();
+    if let Some(i) = shifted.selected() {
+        shifted.select(Some(i + 1));
+    }
+    let list = List::new(items)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(s.title_sakurafrp_tunnels),
+        )
+        .highlight_style(Style::default().bg(Color::Blue).add_modifier(Modifier::BOLD))
+        .highlight_symbol("");
+    f.render_stateful_widget(list, area, &mut shifted);
+}
+
+fn draw_sakurafrp_actions_hint(f: &mut Frame, area: Rect, app: &App) {
+    let s = app.lang.s();
+    let mut spans: Vec<Span> = vec![
+        Span::raw(" "),
+        Span::styled(s.sf_action_refresh, Style::default().fg(Color::White)),
+        Span::raw(" (r)   "),
+        Span::styled(s.sf_action_set_token, Style::default().fg(Color::White)),
+        Span::raw(" (t)   "),
+        Span::styled(
+            s.sf_action_copy_address,
+            Style::default().fg(Color::White),
+        ),
+        Span::raw(" (Enter)"),
+    ];
+    if let Some(err) = &app.natfrp_last_error {
+        spans.push(Span::raw("   "));
+        spans.push(Span::styled(
+            format!("✗ {}", err),
+            Style::default().fg(Color::Red),
+        ));
+    }
+    let p = Paragraph::new(Line::from(spans)).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(s.title_sakurafrp_actions),
+    );
+    f.render_widget(p, area);
+}
+
+/// Truncate `s` to at most `max_cols` display columns (unicode-width aware),
+/// adding an ellipsis if truncation occurred.
+fn truncate_display(s: &str, max_cols: usize) -> String {
+    use unicode_width::UnicodeWidthStr;
+    if UnicodeWidthStr::width(s) <= max_cols {
+        return s.to_string();
+    }
+    let mut out = String::new();
+    let mut w = 0usize;
+    for ch in s.chars() {
+        let cw = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+        if w + cw + 1 > max_cols {
+            break;
+        }
+        out.push(ch);
+        w += cw;
+    }
+    out.push('…');
+    out
 }
 
 fn draw_hints(f: &mut Frame, area: Rect, app: &App) {
