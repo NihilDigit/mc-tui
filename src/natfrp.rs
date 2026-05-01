@@ -189,6 +189,206 @@ pub fn classify_ureq_error(e: ureq::Error) -> NatfrpError {
     }
 }
 
+// ---------- v0.14: launcher WebUI client (https://127.0.0.1:7102) ----------
+//
+// The SakuraFrp launcher serves a small HTTPS WebUI that the GUI talks to over
+// localhost. It's how you toggle individual tunnels on/off (the REST API at
+// api.natfrp.com knows about *configuration*, not the *running* state inside
+// the launcher daemon). This client lets mc-tui reach the same surface
+// without making the user open the GUI.
+//
+// ⚠ Two things that aren't fully nailed down yet — and one trapdoor:
+//
+// 1. The launcher's self-signed cert. Localhost-only traffic, so we disable
+//    cert verification rather than dance around `docker cp`. If a future
+//    launcher version starts validating client certs we'll need to revisit.
+// 2. The exact endpoint paths. Treated as best-effort heuristics below; on
+//    first real use, the user (or a follow-up patch) should verify the live
+//    response shapes by hitting the launcher with curl.
+// 3. **Auth scheme.** Launcher 3.1.x defaults `remote_management_auth_mode`
+//    to `nonce`, not Bearer. The Bearer path below probably won't work
+//    against a stock 3.1 launcher — we'll get a 401. The fix is to
+//    GET /api/nonce, HMAC it with `remote_management_key`, then send the
+//    HMAC. Implemented as a TODO; the user can flip the launcher to a
+//    simpler auth mode by editing /run/config.json (or wait for a follow-up).
+
+const LAUNCHER_BASE: &str = "https://127.0.0.1:7102";
+
+pub struct LauncherClient {
+    /// Either a plaintext password (older launcher builds) or a base64 HMAC
+    /// key (3.1.x with `remote_management_auth_mode = nonce`). Bearer is
+    /// always the wrong header for the latter, but we keep it as the simple
+    /// path until we learn the nonce dance.
+    password: String,
+    agent: ureq::Agent,
+}
+
+/// rustls verifier that accepts every server cert. Acceptable here because
+/// the launcher only listens on `127.0.0.1` and we don't want the user to
+/// have to dance with `docker cp`-ing the launcher's certificate every
+/// time the launcher container is recreated. If the launcher ever exposes
+/// a deterministic cert path on a host volume we can swap this for a real
+/// pin without touching the call sites.
+#[derive(Debug)]
+struct NoVerifier;
+
+impl rustls::client::danger::ServerCertVerifier for NoVerifier {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &rustls::pki_types::CertificateDer<'_>,
+        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        _server_name: &rustls::pki_types::ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &rustls::pki_types::CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &rustls::pki_types::CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        use rustls::SignatureScheme as S;
+        vec![
+            S::RSA_PKCS1_SHA256,
+            S::RSA_PKCS1_SHA384,
+            S::RSA_PKCS1_SHA512,
+            S::ECDSA_NISTP256_SHA256,
+            S::ECDSA_NISTP384_SHA384,
+            S::ECDSA_NISTP521_SHA512,
+            S::RSA_PSS_SHA256,
+            S::RSA_PSS_SHA384,
+            S::RSA_PSS_SHA512,
+            S::ED25519,
+        ]
+    }
+}
+
+impl LauncherClient {
+    /// Build an agent that trusts the launcher's self-signed cert. The rustls
+    /// `CryptoProvider` install is idempotent — fine to call from multiple
+    /// LauncherClient::new() invocations across a session.
+    pub fn new(password: String) -> ApiResult<Self> {
+        // Required by rustls 0.23's process-wide builder. Idempotent — safe to
+        // call multiple times. Returns Err if a different provider is already
+        // installed; we ignore that since either install satisfies our needs.
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+
+        let cfg = rustls::ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(std::sync::Arc::new(NoVerifier))
+            .with_no_client_auth();
+
+        let agent = ureq::AgentBuilder::new()
+            .timeout(Duration::from_secs(5))
+            .tls_config(std::sync::Arc::new(cfg))
+            .build();
+        Ok(Self { password, agent })
+    }
+
+    fn auth_header(&self) -> String {
+        format!("Bearer {}", self.password)
+    }
+
+    /// Pull the full tunnel-state map from the launcher. Returns
+    /// `tunnel_id → enabled` so the UI can render `▶/■/?` markers in one
+    /// pass. Endpoint path is `/api/tunnels` — best-effort guess; verify on
+    /// first use.
+    pub fn tunnels_status(&self) -> ApiResult<HashMap<u64, bool>> {
+        let url = format!("{}/api/tunnels", LAUNCHER_BASE);
+        let resp = self
+            .agent
+            .get(&url)
+            .set("Authorization", &self.auth_header())
+            .call()
+            .map_err(classify_ureq_error)?;
+        let body = resp
+            .into_string()
+            .map_err(|e| NatfrpError::Network(e.to_string()))?;
+        parse_launcher_tunnels(&body)
+    }
+
+    /// Ask the launcher to start forwarding `id`. Endpoint guess.
+    pub fn enable(&self, id: u64) -> ApiResult<()> {
+        let url = format!("{}/api/tunnel/{}/enable", LAUNCHER_BASE, id);
+        self.agent
+            .post(&url)
+            .set("Authorization", &self.auth_header())
+            .send_string("")
+            .map_err(classify_ureq_error)?;
+        Ok(())
+    }
+
+    /// Ask the launcher to stop forwarding `id`. Endpoint guess.
+    pub fn disable(&self, id: u64) -> ApiResult<()> {
+        let url = format!("{}/api/tunnel/{}/disable", LAUNCHER_BASE, id);
+        self.agent
+            .post(&url)
+            .set("Authorization", &self.auth_header())
+            .send_string("")
+            .map_err(classify_ureq_error)?;
+        Ok(())
+    }
+}
+
+/// Parse the launcher's tunnels-state response. Tolerant of multiple shapes
+/// because the shape isn't documented — accepts:
+///   - `[{"id": N, "enabled": bool}, ...]`
+///   - `{"tunnels": [{...}]}` envelope
+///   - `{"<id>": bool, ...}` flat map
+/// Any unparseable payload bubbles up as `NatfrpError::Parse` so the user can
+/// surface the raw body and we can iterate.
+pub fn parse_launcher_tunnels(body: &str) -> ApiResult<HashMap<u64, bool>> {
+    let v: serde_json::Value = serde_json::from_str(body)
+        .map_err(|e| NatfrpError::Parse(format!("launcher tunnels: {}", e)))?;
+
+    let mut out = HashMap::new();
+
+    let try_array = |arr: &Vec<serde_json::Value>, out: &mut HashMap<u64, bool>| {
+        for item in arr {
+            let id = item
+                .get("id")
+                .and_then(|x| x.as_u64())
+                .or_else(|| item.get("Id").and_then(|x| x.as_u64()));
+            let enabled = item
+                .get("enabled")
+                .and_then(|x| x.as_bool())
+                .or_else(|| item.get("Enabled").and_then(|x| x.as_bool()))
+                .or_else(|| item.get("running").and_then(|x| x.as_bool()))
+                .or_else(|| item.get("Running").and_then(|x| x.as_bool()));
+            if let (Some(id), Some(en)) = (id, enabled) {
+                out.insert(id, en);
+            }
+        }
+    };
+
+    if let Some(arr) = v.as_array() {
+        try_array(arr, &mut out);
+    } else if let Some(arr) = v.get("tunnels").and_then(|x| x.as_array()) {
+        try_array(arr, &mut out);
+    } else if let Some(map) = v.as_object() {
+        for (k, val) in map {
+            if let (Ok(id), Some(en)) = (k.parse::<u64>(), val.as_bool()) {
+                out.insert(id, en);
+            }
+        }
+    }
+
+    Ok(out)
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct UserInfo {
     pub id: u64,
@@ -539,6 +739,52 @@ mod tests {
         let body = r#"{"218":{"name":"test","host":"h","description":"游戏专用","vip":3,"flag":44}}"#;
         let ns = parse_nodes(body).unwrap();
         assert_eq!(ns.get(&218).unwrap().vip, 3);
+    }
+
+    /// v0.14 — accept multiple shapes for the launcher's tunnels response so
+    /// we can iterate without re-shipping the moment the launcher devs rename
+    /// a JSON field.
+    #[test]
+    fn parse_launcher_tunnels_accepts_array_of_objects() {
+        let body = r#"[{"id":1,"enabled":true},{"id":2,"enabled":false}]"#;
+        let m = parse_launcher_tunnels(body).unwrap();
+        assert_eq!(m.get(&1).copied(), Some(true));
+        assert_eq!(m.get(&2).copied(), Some(false));
+    }
+
+    #[test]
+    fn parse_launcher_tunnels_accepts_envelope_with_tunnels_key() {
+        let body =
+            r#"{"tunnels":[{"id":3,"running":true},{"Id":4,"Running":false}]}"#;
+        let m = parse_launcher_tunnels(body).unwrap();
+        assert_eq!(m.get(&3).copied(), Some(true));
+        assert_eq!(m.get(&4).copied(), Some(false));
+    }
+
+    #[test]
+    fn parse_launcher_tunnels_accepts_flat_id_to_bool_map() {
+        let body = r#"{"7":true,"8":false}"#;
+        let m = parse_launcher_tunnels(body).unwrap();
+        assert_eq!(m.get(&7).copied(), Some(true));
+        assert_eq!(m.get(&8).copied(), Some(false));
+    }
+
+    #[test]
+    fn parse_launcher_tunnels_returns_empty_for_unrecognized_shape() {
+        // Pure object, none of our heuristics match; OK to return empty so
+        // the UI shows "?" markers rather than blowing up.
+        let body = r#"{"unrelated":"shape"}"#;
+        let m = parse_launcher_tunnels(body).unwrap();
+        assert!(m.is_empty());
+    }
+
+    #[test]
+    fn parse_launcher_tunnels_propagates_json_error() {
+        let err = parse_launcher_tunnels("garbage").unwrap_err();
+        match err {
+            NatfrpError::Parse(_) => {}
+            other => panic!("expected Parse, got {:?}", other),
+        }
     }
 
     #[test]

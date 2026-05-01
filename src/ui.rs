@@ -1160,7 +1160,9 @@ fn draw_sakurafrp_tunnels(f: &mut Frame, area: Rect, app: &mut App) {
     // name, 28-char node label, 4-char type, public address rest). On narrow
     // terminals ratatui will truncate naturally.
     let header = Line::from(vec![
-        Span::raw("  "),
+        // Two leading spaces match the online marker column; the third covers
+        // the v0.14 enable/disable marker column.
+        Span::raw("    "),
         Span::styled(
             format!("{:<10}", s.sf_col_id),
             Style::default().fg(Color::DarkGray),
@@ -1185,16 +1187,29 @@ fn draw_sakurafrp_tunnels(f: &mut Frame, area: Rect, app: &mut App) {
     ]);
 
     let nodes = &app.natfrp_nodes;
+    let enabled_map = app.natfrp_tunnel_enabled.clone();
     let items: Vec<ListItem> = std::iter::once(ListItem::new(header))
         .chain(app.natfrp_tunnels.iter().map(|t| {
             let node_label = crate::natfrp::node_label(t.node, nodes);
             let addr = crate::natfrp::public_address(t, nodes).unwrap_or_else(|| "—".to_string());
             let online_marker = if t.online { "●" } else { "○" };
             let online_color = if t.online { Color::Green } else { Color::DarkGray };
+            // v0.14 — enable/disable marker from launcher state. `?` when the
+            // launcher hasn't been reached this session (no docker, no password,
+            // TLS failure, …).
+            let (enable_marker, enable_color) = match enabled_map.get(&t.id) {
+                Some(true) => ("▶", Color::Green),
+                Some(false) => ("■", Color::Yellow),
+                None => ("?", Color::DarkGray),
+            };
             ListItem::new(Line::from(vec![
                 Span::styled(
                     format!("{} ", online_marker),
                     Style::default().fg(online_color),
+                ),
+                Span::styled(
+                    format!("{} ", enable_marker),
+                    Style::default().fg(enable_color),
                 ),
                 Span::styled(
                     format!("{:<10}", t.id),

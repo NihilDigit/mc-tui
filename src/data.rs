@@ -808,6 +808,66 @@ pub fn parse_docker_state(s: &str) -> DockerState {
     }
 }
 
+/// v0.14 — Pull the launcher's WebUI auth key out of its persisted config.
+/// The natfrp.com/launcher image (v3.1.x as of 2026-05-01) keeps state at
+/// `/run/config.json` with the WebUI key in the `remote_management_key`
+/// field (base64-encoded HMAC key). We try a couple of older paths first
+/// in case a future image relocates it.
+///
+/// Returns:
+///   `Some(key)` on first hit — the **base64 key**, not a plaintext password.
+///     Caller must implement whatever auth scheme the launcher version uses
+///     (`remote_management_auth_mode` in config; "nonce" by default in 3.1).
+///   `None` when the container isn't running, docker isn't on PATH, or no
+///   candidate path yields a parseable key.
+pub fn read_launcher_password(container: &str) -> Option<String> {
+    use std::process::Command;
+    const CANDIDATE_PATHS: &[&str] = &[
+        "/run/config.json",
+        "/var/lib/natfrp-launcher/data.json",
+        "/data/data.json",
+        "/app/data.json",
+        "/root/.natfrp/data.json",
+    ];
+    for path in CANDIDATE_PATHS {
+        let out = Command::new("docker")
+            .args(["exec", container, "cat", path])
+            .output()
+            .ok()?;
+        if !out.status.success() {
+            continue;
+        }
+        let body = String::from_utf8_lossy(&out.stdout);
+        if let Some(pw) = parse_launcher_password(&body) {
+            return Some(pw);
+        }
+    }
+    None
+}
+
+/// Extract the WebUI auth key from the launcher's config blob. Field name
+/// has historically been `password` / `webui_password` / `WebPassword` /
+/// `WebUIPassword` in older builds; current natfrp.com/launcher (3.1.x)
+/// uses `remote_management_key` (base64-encoded HMAC key). We accept any of
+/// them rather than ship-and-pray.
+pub fn parse_launcher_password(body: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(body).ok()?;
+    for key in &[
+        "remote_management_key",
+        "password",
+        "webui_password",
+        "WebPassword",
+        "WebUIPassword",
+    ] {
+        if let Some(s) = v.get(*key).and_then(|x| x.as_str()) {
+            if !s.is_empty() {
+                return Some(s.to_string());
+            }
+        }
+    }
+    None
+}
+
 /// Run `docker <verb> <container>` synchronously and return stdout/stderr in a
 /// single Result so the caller can feed it straight to App.status.
 pub fn docker_lifecycle(verb: &str, container: &str) -> Result<String> {
@@ -1119,6 +1179,44 @@ mod tests {
     #[test]
     fn pgrep_matches_returns_false_when_binary_missing() {
         assert!(!pgrep_matches("/nonexistent-bin-zzzzz", "sparkle"));
+    }
+
+    /// v0.14 — accept the historical launcher field names without a second
+    /// release for each rename. `remote_management_key` is the current
+    /// (3.1.x) field; older field names kept for back-compat.
+    #[test]
+    fn parse_launcher_password_handles_field_aliases() {
+        // 3.1.x — base64 HMAC key
+        assert_eq!(
+            parse_launcher_password(r#"{"remote_management_key":"BASE64KEYHERE="}"#),
+            Some("BASE64KEYHERE=".to_string())
+        );
+        // Older builds
+        assert_eq!(
+            parse_launcher_password(r#"{"password":"abc"}"#),
+            Some("abc".to_string())
+        );
+        assert_eq!(
+            parse_launcher_password(r#"{"webui_password":"xyz"}"#),
+            Some("xyz".to_string())
+        );
+        assert_eq!(
+            parse_launcher_password(r#"{"WebPassword":"PQR"}"#),
+            Some("PQR".to_string())
+        );
+        // Field-priority: remote_management_key wins over legacy `password`.
+        assert_eq!(
+            parse_launcher_password(
+                r#"{"remote_management_key":"new","password":"old"}"#
+            ),
+            Some("new".to_string())
+        );
+        // Empty string is treated as "not configured", same as missing.
+        assert_eq!(parse_launcher_password(r#"{"password":""}"#), None);
+        // Mismatched key
+        assert_eq!(parse_launcher_password(r#"{"foo":"bar"}"#), None);
+        // Non-JSON
+        assert_eq!(parse_launcher_password("nope"), None);
     }
 }
 

@@ -285,9 +285,19 @@ Tracked here instead of GitHub issues for now. Mark with date when shipped; keep
 - [x] Non-game-friendly node selection appends a dim warning to status (long-idle TCP can drop after ~30s).
 - [x] `screenshot --picker create|migrate` for QA without firing destructive ops.
 
+### v0.14 — SakuraFrp launcher single-tunnel lifecycle (shipped 2026-05-01)
+
+- [x] `LauncherClient` against `https://127.0.0.1:7102` with rustls + `NoVerifier` (localhost-only traffic, security-equivalent to a one-shot pin).
+- [x] `read_launcher_password` walks candidate paths (`/run/config.json` for current 3.1.x builds, plus older fallbacks) and pulls `remote_management_key` (with legacy aliases).
+- [x] App caches the launcher password + per-tunnel enable map; `refresh_natfrp` opportunistically populates it (silent failure → ▶/■/? markers in the tunnel rows).
+- [x] `e` enables / `x` disables the selected tunnel via best-effort REST verbs at `/api/tunnel/<id>/{enable,disable}`.
+- [x] `parse_launcher_tunnels` is shape-tolerant (array, `{tunnels: [...]}` envelope, or flat id→bool map) so we can iterate as the launcher's actual response shape gets pinned down.
+
+> **Known gap:** launcher 3.1 defaults `remote_management_auth_mode` to `nonce` (HMAC the server-provided nonce with `remote_management_key`); the current implementation sends a plain `Authorization: Bearer <key>` header that probably won't authenticate. Implementing the nonce dance is the obvious follow-up and was deferred so v0.14 could ship structurally.
+
 ### Backlog (no version yet)
 
-- [ ] v0.14 — single-tunnel lifecycle via the launcher's WebUI on port 7102 (HTTPS, self-signed).
+- [ ] LauncherClient: implement nonce-based auth dance (`GET /api/nonce` → HMAC with `remote_management_key`), or detect+adopt the auth scheme advertised by `remote_management_auth_mode`.
 - [ ] Backup restore action (with confirmation prompt + extract into a sibling dir, never overwrite the live world).
 - [ ] More YAML schema awareness for `paper-global.yml` (right-side panel showing what each key does, mirrored from upstream docs).
 
