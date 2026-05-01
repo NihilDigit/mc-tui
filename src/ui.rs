@@ -946,13 +946,16 @@ fn draw_sakurafrp(f: &mut Frame, area: Rect, app: &mut App) {
     let mihomo_h: u16 = if app.mihomo_running { 1 } else { 0 };
     let user_h: u16 = if app.natfrp_token.is_none() { 5 } else { 4 };
 
+    // Actions panel needs 4 lines (border + 2 content + slack) since v0.15.1
+    // — too many keys to fit on one row.
+    let actions_h: u16 = 4;
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(mihomo_h),
             Constraint::Length(user_h),
             Constraint::Min(3),
-            Constraint::Length(3),
+            Constraint::Length(actions_h),
         ])
         .split(area);
 
@@ -1267,7 +1270,38 @@ fn draw_sakurafrp_tunnels(f: &mut Frame, area: Rect, app: &mut App) {
 
 fn draw_sakurafrp_actions_hint(f: &mut Frame, area: Rect, app: &App) {
     let s = app.lang.s();
-    let mut spans: Vec<Span> = vec![
+    // v0.15.1 — two-line layout. Top line is intent-grouped (lifecycle:
+    // setup / enable / disable). Bottom line is everyday navigation
+    // (refresh / token / browser / copy / write ops). The setup verb is
+    // tinted gold + bold so first-time users see it before anything else.
+    let setup_recommended =
+        app.frpc_binary.is_none() || app.frpc_enabled_ids.is_empty();
+
+    let setup_style = if setup_recommended {
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::White)
+    };
+
+    let line_top = Line::from(vec![
+        Span::raw(" "),
+        Span::styled(s.sf_action_setup, setup_style),
+        Span::raw(" (i)   "),
+        Span::styled(s.sf_action_enable, Style::default().fg(Color::White)),
+        Span::raw(" (e)   "),
+        Span::styled(s.sf_action_disable, Style::default().fg(Color::White)),
+        Span::raw(" (x)   "),
+        Span::styled(s.sf_action_create, Style::default().fg(Color::White)),
+        Span::raw(" (c)   "),
+        Span::styled(s.sf_action_migrate, Style::default().fg(Color::White)),
+        Span::raw(" (m)   "),
+        Span::styled(s.sf_action_delete, Style::default().fg(Color::White)),
+        Span::raw(" (d)"),
+    ]);
+
+    let mut line_bot: Vec<Span> = vec![
         Span::raw(" "),
         Span::styled(s.sf_action_refresh, Style::default().fg(Color::White)),
         Span::raw(" (r)   "),
@@ -1284,17 +1318,15 @@ fn draw_sakurafrp_actions_hint(f: &mut Frame, area: Rect, app: &App) {
         ),
         Span::raw(" (Enter)"),
     ];
-    // Surface the launcher-down hint inline so the user sees it in their
-    // primary visual focus area (not buried two tabs over). Errors (if any)
-    // already render in the user panel so we don't duplicate them here.
     if app.launcher_hint_applicable() {
-        spans.push(Span::raw("   "));
-        spans.push(Span::styled(
+        line_bot.push(Span::raw("   "));
+        line_bot.push(Span::styled(
             s.sf_launcher_hint,
             Style::default().fg(Color::Yellow),
         ));
     }
-    let p = Paragraph::new(Line::from(spans)).block(
+
+    let p = Paragraph::new(vec![line_top, Line::from(line_bot)]).block(
         Block::default()
             .borders(Borders::ALL)
             .title(s.title_sakurafrp_actions),
