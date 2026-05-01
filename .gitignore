@@ -3,3 +3,6 @@
 .DS_Store
 .idea/
 .vscode/
+
+# Local working notes — kept out of version control on purpose.
+SAKURAFRP_PLAN.md
