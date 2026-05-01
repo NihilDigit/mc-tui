@@ -4,5 +4,11 @@
 .idea/
 .vscode/
 
+# Claude Code agent isolation worktrees + per-project state. These are
+# per-machine caches; never commit. (Pre-v0.17 a stale gitlink to one of
+# these slipped into the index — `git rm --cached` cleaned it up.)
+.claude/
+
 # Local working notes — kept out of version control on purpose.
 SAKURAFRP_PLAN.md
+user_prompts.txt
