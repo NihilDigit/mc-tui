@@ -751,6 +751,32 @@ pub struct SakuraFrpDocker {
     pub state: DockerState,
 }
 
+/// True when there's a `sparkle` process owning the user's mihomo instance
+/// (Sparkle wraps mihomo on this host). The user's friend-server workflow
+/// requires Sparkle/mihomo to be killed before friends connect — long-idle TCP
+/// inside mihomo's fake-ip tunnel gets reaped at ~30s, which silently breaks
+/// the SakuraFrp ↔ Minecraft path. We surface a hint, never auto-kill.
+pub fn mihomo_running() -> bool {
+    pgrep_matches("pgrep", "sparkle")
+}
+
+/// Inner helper, factored for testability: invokes `<bin> -f <pattern>` and
+/// returns true on exit code 0 (pgrep convention = "matched at least one
+/// process"). A missing binary or any spawn failure → `false` so callers can
+/// treat the function as "is the named pattern definitely running?" without
+/// guarding against errors.
+fn pgrep_matches(bin: &str, pattern: &str) -> bool {
+    use std::process::{Command, Stdio};
+    Command::new(bin)
+        .args(["-f", pattern])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
 pub fn detect_sakurafrp_docker(container: &str) -> SakuraFrpDocker {
     use std::process::Command;
     let out = Command::new("docker")
@@ -1074,5 +1100,25 @@ pub fn list_yaml_files(server_dir: &Path) -> Vec<PathBuf> {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `/bin/false` exists on every Unix and exits 1 unconditionally. Standing
+    /// in for "pgrep ran but matched nothing" — we expect false, never a panic.
+    #[test]
+    fn pgrep_matches_returns_false_on_nonzero_exit() {
+        assert!(!pgrep_matches("/bin/false", "sparkle"));
+    }
+
+    /// A nonexistent binary path triggers a spawn error. We must return false
+    /// rather than propagate or panic — production callers treat the function
+    /// as "is the pattern definitely running?".
+    #[test]
+    fn pgrep_matches_returns_false_when_binary_missing() {
+        assert!(!pgrep_matches("/nonexistent-bin-zzzzz", "sparkle"));
+    }
 }
 

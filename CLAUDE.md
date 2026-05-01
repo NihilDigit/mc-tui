@@ -268,10 +268,18 @@ Tracked here instead of GitHub issues for now. Mark with date when shipped; keep
 - [x] `Enter` on a tunnel row copies its `host:port` to the clipboard via `wl-copy`; `t` opens the token prompt; `r` re-fetches.
 - [x] API never fires from `refresh_all()`; only on first SakuraFrp tab visit and explicit `r`.
 
+### v0.12 — SakuraFrp onboarding & error diagnostics (shipped 2026-05-01)
+
+- [x] Numbered 3-step onboarding when no token is set (`o` to open natfrp.com, `t` to paste).
+- [x] Empty-tunnels guidance branch (forwards-references v0.13's `c` create command + browser fallback + launcher GUI fallback).
+- [x] `NatfrpError` enum (`Unauthorized` / `Forbidden` / `ServerError(u16)` / `HttpError(u16)` / `Network(String)` / `Parse(String)`) replacing raw anyhow strings; centralized `translate_natfrp_error` reusable by v0.13 write paths.
+- [x] Sparkle/mihomo presence detector (`mihomo_running()` via `pgrep -f sparkle`); dim warning line on tab when running. Never auto-kills.
+- [x] Traffic plan % usage with ≥80% yellow / ≥95% red color gradient; launcher-down hint surfaced on the actions row when applicable.
+
 ### Backlog (no version yet)
 
-- [ ] v0.11 — write operations against `/tunnels` (create / migrate / delete) and node picker UI.
-- [ ] v0.12 — single-tunnel lifecycle via the launcher's WebUI on port 7102 (HTTPS, self-signed).
+- [ ] v0.13 — write operations against `/tunnels` (create / migrate / delete) and node picker UI.
+- [ ] v0.14 — single-tunnel lifecycle via the launcher's WebUI on port 7102 (HTTPS, self-signed).
 - [ ] Backup restore action (with confirmation prompt + extract into a sibling dir, never overwrite the live world).
 - [ ] More YAML schema awareness for `paper-global.yml` (right-side panel showing what each key does, mirrored from upstream docs).
 

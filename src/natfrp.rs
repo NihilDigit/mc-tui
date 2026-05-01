@@ -7,12 +7,48 @@
 //! 2026-05-01 — fields are what the server actually returns, not OpenAPI guesses.
 
 use std::collections::HashMap;
+use std::fmt;
 use std::time::Duration;
 
-use anyhow::{Context, Result, anyhow};
 use serde::Deserialize;
 
 const API_BASE: &str = "https://api.natfrp.com/v4";
+
+/// Typed error so the caller can translate to user-facing copy. `Display` is the
+/// English fallback for logs / debug — the UI layer is expected to pattern-match
+/// and produce a localized string.
+#[derive(Debug, Clone)]
+pub enum NatfrpError {
+    /// 401 — token is wrong / revoked / cleared by the user on the server side.
+    Unauthorized,
+    /// 403 — token authenticated but lacks the permission bit for this endpoint.
+    Forbidden,
+    /// 5xx from `api.natfrp.com` — server-side outage / overload.
+    ServerError(u16),
+    /// Other non-2xx HTTP statuses (e.g. 404, 429, 4xx outside the above).
+    HttpError(u16),
+    /// DNS / TCP / TLS / timeout — couldn't talk to the API at all.
+    Network(String),
+    /// JSON body didn't match the expected schema.
+    Parse(String),
+}
+
+impl fmt::Display for NatfrpError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            NatfrpError::Unauthorized => write!(f, "401 Unauthorized"),
+            NatfrpError::Forbidden => write!(f, "403 Forbidden"),
+            NatfrpError::ServerError(code) => write!(f, "{} server error", code),
+            NatfrpError::HttpError(code) => write!(f, "HTTP {}", code),
+            NatfrpError::Network(detail) => write!(f, "network: {}", detail),
+            NatfrpError::Parse(detail) => write!(f, "parse: {}", detail),
+        }
+    }
+}
+
+impl std::error::Error for NatfrpError {}
+
+pub type ApiResult<T> = Result<T, NatfrpError>;
 
 pub struct Client {
     token: String,
@@ -27,37 +63,52 @@ impl Client {
         Self { token, agent }
     }
 
-    fn get_text(&self, path: &str) -> Result<String> {
+    fn get_text(&self, path: &str) -> ApiResult<String> {
         let url = format!("{}{}", API_BASE, path);
         let resp = self
             .agent
             .get(&url)
             .set("Authorization", &format!("Bearer {}", self.token))
             .call()
-            .with_context(|| format!("GET {}", path))?;
-        resp.into_string().with_context(|| format!("read body {}", path))
+            .map_err(classify_ureq_error)?;
+        resp.into_string()
+            .map_err(|e| NatfrpError::Network(e.to_string()))
     }
 
-    pub fn user_info(&self) -> Result<UserInfo> {
+    pub fn user_info(&self) -> ApiResult<UserInfo> {
         let body = self.get_text("/user/info")?;
         parse_user_info(&body)
     }
 
-    pub fn tunnels(&self) -> Result<Vec<Tunnel>> {
+    pub fn tunnels(&self) -> ApiResult<Vec<Tunnel>> {
         let body = self.get_text("/tunnels")?;
         parse_tunnels(&body)
     }
 
-    pub fn nodes(&self) -> Result<HashMap<u64, Node>> {
+    pub fn nodes(&self) -> ApiResult<HashMap<u64, Node>> {
         let body = self.get_text("/nodes")?;
         parse_nodes(&body)
     }
 
     /// Map of unix-epoch-seconds → bytes used in that bucket. Caller sums or
     /// picks the latest depending on what they want to display.
-    pub fn tunnel_traffic(&self, id: u64) -> Result<HashMap<u64, u64>> {
+    pub fn tunnel_traffic(&self, id: u64) -> ApiResult<HashMap<u64, u64>> {
         let body = self.get_text(&format!("/tunnel/traffic?id={}", id))?;
         parse_tunnel_traffic(&body)
+    }
+}
+
+/// Map a ureq::Error to our typed enum. ureq splits errors into Status (HTTP
+/// non-2xx) and Transport (everything else: DNS, TCP, TLS, timeout, ...).
+pub fn classify_ureq_error(e: ureq::Error) -> NatfrpError {
+    match e {
+        ureq::Error::Status(code, _resp) => match code {
+            401 => NatfrpError::Unauthorized,
+            403 => NatfrpError::Forbidden,
+            500..=599 => NatfrpError::ServerError(code),
+            other => NatfrpError::HttpError(other),
+        },
+        ureq::Error::Transport(t) => NatfrpError::Network(t.to_string()),
     }
 }
 
@@ -118,32 +169,36 @@ pub struct Node {
     pub flag: u32,
 }
 
-pub fn parse_user_info(body: &str) -> Result<UserInfo> {
-    serde_json::from_str(body).with_context(|| "parse /user/info")
+pub fn parse_user_info(body: &str) -> ApiResult<UserInfo> {
+    serde_json::from_str(body).map_err(|e| NatfrpError::Parse(format!("/user/info: {}", e)))
 }
 
-pub fn parse_tunnels(body: &str) -> Result<Vec<Tunnel>> {
-    serde_json::from_str(body).with_context(|| "parse /tunnels")
+pub fn parse_tunnels(body: &str) -> ApiResult<Vec<Tunnel>> {
+    serde_json::from_str(body).map_err(|e| NatfrpError::Parse(format!("/tunnels: {}", e)))
 }
 
-pub fn parse_nodes(body: &str) -> Result<HashMap<u64, Node>> {
-    let raw: HashMap<String, Node> =
-        serde_json::from_str(body).with_context(|| "parse /nodes")?;
+pub fn parse_nodes(body: &str) -> ApiResult<HashMap<u64, Node>> {
+    let raw: HashMap<String, Node> = serde_json::from_str(body)
+        .map_err(|e| NatfrpError::Parse(format!("/nodes: {}", e)))?;
     let mut out = HashMap::with_capacity(raw.len());
     for (k, v) in raw {
-        let id: u64 = k.parse().map_err(|_| anyhow!("non-numeric node id: {}", k))?;
+        let id: u64 = k
+            .parse()
+            .map_err(|_| NatfrpError::Parse(format!("non-numeric node id: {}", k)))?;
         out.insert(id, v);
     }
     Ok(out)
 }
 
 #[allow(dead_code)] // exposed via Client::tunnel_traffic for v0.10 MTD usage; kept for v0.11
-pub fn parse_tunnel_traffic(body: &str) -> Result<HashMap<u64, u64>> {
-    let raw: HashMap<String, u64> =
-        serde_json::from_str(body).with_context(|| "parse /tunnel/traffic")?;
+pub fn parse_tunnel_traffic(body: &str) -> ApiResult<HashMap<u64, u64>> {
+    let raw: HashMap<String, u64> = serde_json::from_str(body)
+        .map_err(|e| NatfrpError::Parse(format!("/tunnel/traffic: {}", e)))?;
     let mut out = HashMap::with_capacity(raw.len());
     for (k, v) in raw {
-        let ts: u64 = k.parse().map_err(|_| anyhow!("non-numeric ts: {}", k))?;
+        let ts: u64 = k
+            .parse()
+            .map_err(|_| NatfrpError::Parse(format!("non-numeric ts: {}", k)))?;
         out.insert(ts, v);
     }
     Ok(out)
@@ -287,5 +342,31 @@ mod tests {
         ts[0].remote.clear();
         let ns = parse_nodes(SAMPLE_NODES).unwrap();
         assert!(public_address(&ts[0], &ns).is_none());
+    }
+
+    /// Parse failures bubble up as NatfrpError::Parse so the UI can show a
+    /// distinct "schema drifted" message rather than hiding it inside a generic
+    /// network error.
+    #[test]
+    fn parse_returns_parse_variant_on_bad_json() {
+        let err = parse_user_info("{not json}").unwrap_err();
+        match err {
+            NatfrpError::Parse(_) => {}
+            other => panic!("expected Parse, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn natfrp_error_display_is_specific_per_variant() {
+        // Display strings double as a debug log when the UI doesn't translate;
+        // make sure each variant says something distinguishable.
+        assert!(format!("{}", NatfrpError::Unauthorized).contains("401"));
+        assert!(format!("{}", NatfrpError::Forbidden).contains("403"));
+        assert!(format!("{}", NatfrpError::ServerError(503)).contains("503"));
+        assert!(format!("{}", NatfrpError::HttpError(404)).contains("404"));
+        let net = format!("{}", NatfrpError::Network("dns failed".into()));
+        assert!(net.contains("dns failed"));
+        let parse = format!("{}", NatfrpError::Parse("bad json".into()));
+        assert!(parse.contains("bad json"));
     }
 }

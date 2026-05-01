@@ -206,6 +206,12 @@ struct App {
     /// on first tab visit so we don't keep re-firing requests.
     pub natfrp_loaded: bool,
 
+    // v0.12 — Sparkle/mihomo presence indicator. Pure cache; refresh_all() walks
+    // proc table once per refresh tick. Surfaced on the SakuraFrp tab as a dim
+    // warning line, since the user has explicitly said the auto-kill behavior
+    // is off-limits.
+    pub mihomo_running: bool,
+
     pub status: String,
     pub prompt: Option<InputPrompt>,
 
@@ -264,6 +270,7 @@ impl App {
             natfrp_last_error: None,
             natfrp_state: ListState::default(),
             natfrp_loaded: false,
+            mihomo_running: false,
             status: match lang {
                 Lang::En => String::from("Ready."),
                 Lang::Zh => String::from("就绪。"),
@@ -333,6 +340,7 @@ impl App {
         self.yaml_files = list_yaml_files(&self.server_dir);
         self.backups = scan_backups(&self.server_dir);
         self.sakurafrp_docker = detect_sakurafrp_docker(&self.sakurafrp_container);
+        self.mihomo_running = mihomo_running();
         self.whitelist_enabled = get_property(&self.properties, "white-list")
             .map(|v| v.eq_ignore_ascii_case("true"))
             .unwrap_or(false);
@@ -412,8 +420,11 @@ impl App {
 
     /// Hits api.natfrp.com for /user/info + /tunnels + /nodes. Blocking — only
     /// call from user-initiated paths (tab open, `r`). Errors land in
-    /// `natfrp_last_error`; partial success is allowed (e.g. user info loads
-    /// but tunnels fail) so the UI shows what it can.
+    /// `natfrp_last_error` already translated to the active language; partial
+    /// success is allowed (e.g. user info loads but tunnels fail) so the UI
+    /// shows what it can. We surface only the *first* error — a 401 triggered
+    /// by user_info will also fail tunnels and nodes; chaining all three would
+    /// just spam the status bar.
     fn refresh_natfrp(&mut self) {
         let Some(token) = self.natfrp_token.clone() else {
             self.natfrp_last_error = Some(self.lang.s().sf_user_no_token.to_string());
@@ -423,10 +434,10 @@ impl App {
         self.natfrp_loaded = true;
         let client = natfrp::Client::new(token);
 
-        let mut errors: Vec<String> = Vec::new();
+        let mut first_err: Option<natfrp::NatfrpError> = None;
         match client.user_info() {
             Ok(u) => self.natfrp_user = Some(u),
-            Err(e) => errors.push(format!("user_info: {}", e)),
+            Err(e) => first_err = first_err.or(Some(e)),
         }
         match client.tunnels() {
             Ok(ts) => {
@@ -435,26 +446,90 @@ impl App {
                     self.natfrp_state.select(Some(0));
                 }
             }
-            Err(e) => errors.push(format!("tunnels: {}", e)),
+            Err(e) => first_err = first_err.or(Some(e)),
         }
         // Only fetch /nodes once per session — the list rarely changes.
         if self.natfrp_nodes.is_empty() {
             match client.nodes() {
                 Ok(n) => self.natfrp_nodes = n,
-                Err(e) => errors.push(format!("nodes: {}", e)),
+                Err(e) => first_err = first_err.or(Some(e)),
             }
         }
 
-        if errors.is_empty() {
-            self.natfrp_last_error = None;
-            self.status = self.lang.s().refreshed.to_string();
-        } else {
-            self.natfrp_last_error = Some(errors.join("; "));
-            self.status = match self.lang {
-                Lang::En => format!("✗ SakuraFrp: {}", errors.join("; ")),
-                Lang::Zh => format!("✗ SakuraFrp 出错: {}", errors.join("; ")),
-            };
+        match first_err {
+            None => {
+                self.natfrp_last_error = None;
+                self.status = self.lang.s().refreshed.to_string();
+            }
+            Some(e) => {
+                let msg = translate_natfrp_error(self.lang, &e);
+                self.natfrp_last_error = Some(msg.clone());
+                self.status = msg;
+            }
         }
+    }
+
+    /// v0.12 — fire `xdg-open` on the SakuraFrp access-key page so the user
+    /// doesn't have to remember the URL or click around the dashboard. Falls
+    /// back to copying the URL via wl-copy when xdg-open isn't available
+    /// (headless / no portal). The deep link lands on the access-key tab.
+    fn open_natfrp_dashboard(&mut self) {
+        const URL: &str = "https://www.natfrp.com/user/edit/auth#info-key";
+        let opened = std::process::Command::new("xdg-open")
+            .arg(URL)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if opened {
+            self.status = match self.lang {
+                Lang::En => format!("✓ Opened {} in your browser.", URL),
+                Lang::Zh => format!("✓ 已在浏览器打开 {}。", URL),
+            };
+            return;
+        }
+        // Best-effort clipboard fallback. Tell the user even when wl-copy
+        // succeeds — they may have expected a browser to pop.
+        let copied = std::process::Command::new("wl-copy")
+            .arg(URL)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        self.status = match (self.lang, copied) {
+            (Lang::En, true) => {
+                format!("ℹ xdg-open unavailable; copied {} to clipboard.", URL)
+            }
+            (Lang::En, false) => {
+                format!("ℹ Open this URL manually: {}", URL)
+            }
+            (Lang::Zh, true) => {
+                format!("ℹ xdg-open 不可用；已把 {} 复制到剪贴板。", URL)
+            }
+            (Lang::Zh, false) => {
+                format!("ℹ 请手动打开此 URL：{}", URL)
+            }
+        };
+    }
+
+    /// True when launcher container is up but the user has at least one tunnel
+    /// the API knows about — the (rare) "everything is configured but nothing
+    /// is moving" state we don't need to nag about. False otherwise → show the
+    /// `sf_launcher_hint` so the user knows where to go next. Treats Unknown
+    /// as "no docker / no opinion" → no hint, since the user might be on a
+    /// host where docker isn't the launcher transport.
+    fn launcher_hint_applicable(&self) -> bool {
+        if self.natfrp_tunnels.is_empty() {
+            return false;
+        }
+        matches!(
+            self.sakurafrp_docker.state,
+            data::DockerState::Stopped | data::DockerState::Missing
+        )
     }
 
     fn set_natfrp_token(&mut self, token: &str) -> Result<()> {
@@ -1594,11 +1669,11 @@ fn run<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<()> {
                     app.remove_selected_player()?;
                 }
             }
-            KeyCode::Char('o') => {
-                if app.tab == TabId::Players {
-                    app.toggle_op_for_selected()?;
-                }
-            }
+            KeyCode::Char('o') => match app.tab {
+                TabId::Players => app.toggle_op_for_selected()?,
+                TabId::SakuraFrp => app.open_natfrp_dashboard(),
+                _ => {}
+            },
             KeyCode::Char('w') => {
                 if app.tab == TabId::Players {
                     app.toggle_whitelist_enabled()?;
@@ -1651,6 +1726,20 @@ fn run<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<()> {
             }
             _ => {}
         }
+    }
+}
+
+/// Map a `NatfrpError` to a localized status-bar / error-line string. Centralized
+/// so v0.13's write-path (create / migrate / delete tunnel) can reuse the same
+/// translations without re-deriving the same prose.
+fn translate_natfrp_error(lang: Lang, err: &natfrp::NatfrpError) -> String {
+    match err {
+        natfrp::NatfrpError::Unauthorized => lang.s().sf_err_unauthorized.to_string(),
+        natfrp::NatfrpError::Forbidden => lang.s().sf_err_forbidden.to_string(),
+        natfrp::NatfrpError::ServerError(code) => fmt_sf_err_server(lang, *code),
+        natfrp::NatfrpError::HttpError(code) => fmt_sf_err_http(lang, *code),
+        natfrp::NatfrpError::Network(detail) => fmt_sf_err_network(lang, detail),
+        natfrp::NatfrpError::Parse(detail) => fmt_sf_err_parse(lang, detail),
     }
 }
 
@@ -2156,6 +2245,49 @@ mod tests {
         assert!(en.contains("running"));
         assert!(zh.contains("运行中"));
         assert!(en.contains("42") && zh.contains("42"));
+    }
+
+    /// v0.12 — every NatfrpError variant maps to a distinct, language-appropriate
+    /// message, and the action hint (press t / pkill sparkle / wait + r) is
+    /// preserved in both languages. Regressions here would silently revert the
+    /// onboarding fix back to the pre-v0.12 "✗ user_info: GET /user/info" mess.
+    #[test]
+    fn natfrp_error_translation_covers_every_variant() {
+        use natfrp::NatfrpError as E;
+        let cases = [
+            E::Unauthorized,
+            E::Forbidden,
+            E::ServerError(503),
+            E::HttpError(404),
+            E::Network("dns failed".into()),
+            E::Parse("bad json".into()),
+        ];
+        let mut en_msgs = Vec::new();
+        let mut zh_msgs = Vec::new();
+        for e in &cases {
+            let en = translate_natfrp_error(Lang::En, e);
+            let zh = translate_natfrp_error(Lang::Zh, e);
+            assert!(!en.is_empty());
+            assert!(!zh.is_empty());
+            assert_ne!(en, zh, "EN/ZH should differ for {:?}", e);
+            en_msgs.push(en);
+            zh_msgs.push(zh);
+        }
+        // 401 → mentions `t` (paste a token); 403 → mentions permissions.
+        assert!(en_msgs[0].contains('t'));
+        assert!(zh_msgs[0].contains('t'));
+        assert!(en_msgs[1].to_lowercase().contains("permission"));
+        assert!(zh_msgs[1].contains("权限"));
+        // 5xx vs 4xx leak the actual code so the user can grep the dashboard.
+        assert!(en_msgs[2].contains("503"));
+        assert!(zh_msgs[3].contains("404"));
+        // Network suggests the mihomo workaround.
+        assert!(en_msgs[4].contains("sparkle"));
+        assert!(zh_msgs[4].contains("sparkle"));
+        // Distinct messages per variant within the same language.
+        let unique: std::collections::HashSet<&str> =
+            en_msgs.iter().map(String::as_str).collect();
+        assert_eq!(unique.len(), cases.len(), "EN messages should all differ");
     }
 
     #[test]

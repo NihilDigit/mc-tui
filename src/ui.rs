@@ -821,48 +821,99 @@ fn draw_server_actions(f: &mut Frame, area: Rect, app: &mut App) {
 fn draw_sakurafrp(f: &mut Frame, area: Rect, app: &mut App) {
     let s = app.lang.s();
 
-    // Top: 4-line "User" panel (border + 2 content lines + slack).
-    // Middle: tunnel list, takes whatever's left.
-    // Bottom: actions hint (3 lines, last token-state line included).
+    // v0.12 — variable layout:
+    //   * mihomo warning line (0 or 1) — only shown when Sparkle/mihomo is up
+    //   * user panel: 5 lines for the 3-step onboarding when tokenless,
+    //     4 lines once we have a token (so the row layout matches v0.10).
+    //   * tunnel list: takes remaining vertical space.
+    //   * actions hint: 3 lines with the new `o` action surfaced.
+    let mihomo_h: u16 = if app.mihomo_running { 1 } else { 0 };
+    let user_h: u16 = if app.natfrp_token.is_none() { 5 } else { 4 };
+
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(4),
+            Constraint::Length(mihomo_h),
+            Constraint::Length(user_h),
             Constraint::Min(3),
             Constraint::Length(3),
         ])
         .split(area);
 
-    draw_sakurafrp_user(f, chunks[0], app);
-    draw_sakurafrp_tunnels(f, chunks[1], app);
-    draw_sakurafrp_actions_hint(f, chunks[2], app);
+    if mihomo_h > 0 {
+        draw_sakurafrp_mihomo_warning(f, chunks[0], app);
+    }
+    draw_sakurafrp_user(f, chunks[1], app);
+    draw_sakurafrp_tunnels(f, chunks[2], app);
+    draw_sakurafrp_actions_hint(f, chunks[3], app);
     let _ = s; // referenced through nested fns
+}
+
+/// One-line dim warning when Sparkle/mihomo is running. Doesn't block anything;
+/// just primes the user before friends connect.
+fn draw_sakurafrp_mihomo_warning(f: &mut Frame, area: Rect, app: &App) {
+    let s = app.lang.s();
+    let p = Paragraph::new(Line::from(Span::styled(
+        format!(" {}", s.sf_mihomo_warning),
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::DIM),
+    )));
+    f.render_widget(p, area);
 }
 
 fn draw_sakurafrp_user(f: &mut Frame, area: Rect, app: &App) {
     let s = app.lang.s();
     let lines: Vec<Line> = if app.natfrp_token.is_none() {
-        vec![Line::from(Span::styled(
-            s.sf_user_no_token,
-            Style::default().fg(Color::DarkGray),
-        ))]
+        // v0.12 onboarding: numbered 3-step intro replacing the cryptic "(no
+        // token set)" one-liner. Each step calls out the action so users with
+        // ADHD don't lose the thread when they alt-tab to the browser.
+        vec![
+            Line::from(Span::styled(
+                format!(" {}", s.sf_onboarding_step1),
+                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            )),
+            Line::from(Span::styled(
+                format!(" {}", s.sf_onboarding_step2),
+                Style::default().fg(Color::White),
+            )),
+            Line::from(Span::styled(
+                format!(" {}", s.sf_onboarding_step3),
+                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            )),
+        ]
     } else if let Some(u) = &app.natfrp_user {
         let token_disp = app
             .natfrp_token
             .as_deref()
             .map(crate::natfrp::redact_token)
             .unwrap_or_default();
-        let traffic_line = if u.traffic.len() == 2 {
-            format!(
-                "{}: {} / {}  ({})",
-                s.sf_user_traffic_label,
-                crate::natfrp::fmt_bytes(u.traffic[0]),
-                crate::natfrp::fmt_bytes(u.traffic[1]),
-                u.speed,
+
+        // v0.12 — color-code traffic by % used. Color choice extracted to
+        // `traffic_color_for` so it can be unit-tested without spinning up a
+        // ratatui frame. Plan stops short of hard-blocking the user.
+        let (traffic_text, traffic_color) = if u.traffic.len() == 2 {
+            let used = u.traffic[0];
+            let total = u.traffic[1];
+            let pct = traffic_pct(used, total);
+            (
+                format!(
+                    "{}: {} / {} ({:.0}%)  ({})",
+                    s.sf_user_traffic_label,
+                    crate::natfrp::fmt_bytes(used),
+                    crate::natfrp::fmt_bytes(total),
+                    pct,
+                    u.speed,
+                ),
+                traffic_color_for(pct),
             )
         } else {
-            format!("{}: ({})", s.sf_user_traffic_label, u.speed)
+            (
+                format!("{}: ({})", s.sf_user_traffic_label, u.speed),
+                Color::White,
+            )
         };
+
         vec![
             Line::from(vec![
                 Span::styled(
@@ -881,12 +932,13 @@ fn draw_sakurafrp_user(f: &mut Frame, area: Rect, app: &App) {
             ]),
             Line::from(vec![
                 Span::raw(" "),
-                Span::styled(traffic_line, Style::default().fg(Color::White)),
+                Span::styled(traffic_text, Style::default().fg(traffic_color)),
             ]),
         ]
     } else if let Some(err) = &app.natfrp_last_error {
+        // err is already translated by refresh_natfrp; render verbatim.
         vec![Line::from(Span::styled(
-            format!(" ✗ {}", err),
+            format!(" {}", err),
             Style::default().fg(Color::Red),
         ))]
     } else {
@@ -906,14 +958,27 @@ fn draw_sakurafrp_user(f: &mut Frame, area: Rect, app: &App) {
 
 fn draw_sakurafrp_tunnels(f: &mut Frame, area: Rect, app: &mut App) {
     let s = app.lang.s();
-    if app.natfrp_token.is_none() || (app.natfrp_tunnels.is_empty() && !app.natfrp_loaded) {
-        let msg = if app.natfrp_token.is_none() {
-            s.sf_user_no_token
-        } else {
-            s.sf_tunnels_loading
-        };
+
+    // No token: tunnels panel mirrors the user-panel onboarding so the user's
+    // eye doesn't have to scan two contradicting empty messages.
+    if app.natfrp_token.is_none() {
+        let p = Paragraph::new(vec![Line::from(Span::styled(
+            format!(" {}", s.sf_user_no_token),
+            Style::default().fg(Color::DarkGray),
+        ))])
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(s.title_sakurafrp_tunnels),
+        );
+        f.render_widget(p, area);
+        return;
+    }
+
+    // Token set, refresh hasn't fired yet.
+    if app.natfrp_tunnels.is_empty() && !app.natfrp_loaded {
         let p = Paragraph::new(Line::from(Span::styled(
-            msg,
+            s.sf_tunnels_loading,
             Style::default().fg(Color::DarkGray),
         )))
         .block(
@@ -924,12 +989,55 @@ fn draw_sakurafrp_tunnels(f: &mut Frame, area: Rect, app: &mut App) {
         f.render_widget(p, area);
         return;
     }
-    if app.natfrp_tunnels.is_empty() {
+
+    // If the API call errored before we got any user info, don't claim "no
+    // tunnels" — we genuinely don't know. Show a neutral message and let the
+    // error in the user panel above carry the actionable diagnosis.
+    if app.natfrp_tunnels.is_empty()
+        && app.natfrp_last_error.is_some()
+        && app.natfrp_user.is_none()
+    {
         let p = Paragraph::new(Line::from(Span::styled(
-            s.sf_tunnels_none,
+            format!(" {}", s.sf_tunnels_loading),
             Style::default().fg(Color::DarkGray),
         )))
         .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(s.title_sakurafrp_tunnels),
+        );
+        f.render_widget(p, area);
+        return;
+    }
+
+    // Refresh succeeded, account exists, but the user hasn't created any
+    // tunnels yet. v0.12 swaps the curt one-liner for a 3-option fork that
+    // forwards-references v0.13's `c` command without depending on it.
+    if app.natfrp_tunnels.is_empty() {
+        let lines = vec![
+            Line::from(Span::styled(
+                format!(" {}", s.sf_tunnels_empty_header),
+                Style::default().fg(Color::DarkGray),
+            )),
+            Line::raw(""),
+            Line::from(Span::styled(
+                s.sf_tunnels_empty_option_v013,
+                Style::default().fg(Color::DarkGray).add_modifier(Modifier::DIM),
+            )),
+            Line::from(Span::styled(
+                s.sf_tunnels_empty_option_browser_a,
+                Style::default().fg(Color::White),
+            )),
+            Line::from(Span::styled(
+                s.sf_tunnels_empty_option_browser_b,
+                Style::default().fg(Color::White),
+            )),
+            Line::from(Span::styled(
+                s.sf_tunnels_empty_option_launcher,
+                Style::default().fg(Color::White),
+            )),
+        ];
+        let p = Paragraph::new(lines).block(
             Block::default()
                 .borders(Borders::ALL)
                 .title(s.title_sakurafrp_tunnels),
@@ -1035,16 +1143,24 @@ fn draw_sakurafrp_actions_hint(f: &mut Frame, area: Rect, app: &App) {
         Span::styled(s.sf_action_set_token, Style::default().fg(Color::White)),
         Span::raw(" (t)   "),
         Span::styled(
+            s.sf_action_open_dashboard,
+            Style::default().fg(Color::White),
+        ),
+        Span::raw(" (o)   "),
+        Span::styled(
             s.sf_action_copy_address,
             Style::default().fg(Color::White),
         ),
         Span::raw(" (Enter)"),
     ];
-    if let Some(err) = &app.natfrp_last_error {
+    // Surface the launcher-down hint inline so the user sees it in their
+    // primary visual focus area (not buried two tabs over). Errors (if any)
+    // already render in the user panel so we don't duplicate them here.
+    if app.launcher_hint_applicable() {
         spans.push(Span::raw("   "));
         spans.push(Span::styled(
-            format!("✗ {}", err),
-            Style::default().fg(Color::Red),
+            s.sf_launcher_hint,
+            Style::default().fg(Color::Yellow),
         ));
     }
     let p = Paragraph::new(Line::from(spans)).block(
@@ -1053,6 +1169,27 @@ fn draw_sakurafrp_actions_hint(f: &mut Frame, area: Rect, app: &App) {
             .title(s.title_sakurafrp_actions),
     );
     f.render_widget(p, area);
+}
+
+/// Percentage-used for the SakuraFrp traffic plan. Guards against division by
+/// zero (some accounts / responses report `total = 0` for unlimited plans).
+pub fn traffic_pct(used: u64, total: u64) -> f64 {
+    if total == 0 {
+        return 0.0;
+    }
+    (used as f64 / total as f64) * 100.0
+}
+
+/// Map a usage % to the color the traffic line should render in. Thresholds
+/// match the v0.12 plan: ≥95 red, ≥80 yellow, else white.
+pub fn traffic_color_for(pct: f64) -> Color {
+    if pct >= 95.0 {
+        Color::Red
+    } else if pct >= 80.0 {
+        Color::Yellow
+    } else {
+        Color::White
+    }
 }
 
 /// Truncate `s` to at most `max_cols` display columns (unicode-width aware),
@@ -1124,5 +1261,41 @@ fn centered_rect(w_pct: u16, h_lines: u16, area: Rect) -> Rect {
         y,
         width: w,
         height: h_lines.min(area.height),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn traffic_pct_handles_zero_total() {
+        // Unlimited / unconfigured plans report total=0; we must not divide by
+        // zero (would render as NaN% in the UI).
+        assert_eq!(traffic_pct(123_456, 0), 0.0);
+    }
+
+    #[test]
+    fn traffic_pct_examples() {
+        assert!((traffic_pct(0, 100) - 0.0).abs() < 1e-9);
+        assert!((traffic_pct(50, 100) - 50.0).abs() < 1e-9);
+        assert!((traffic_pct(100, 100) - 100.0).abs() < 1e-9);
+        // Over-quota: don't clamp — the user should see >100% so they know
+        // they've burst past the plan.
+        assert!((traffic_pct(150, 100) - 150.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn traffic_color_thresholds() {
+        // Below 80% → white (default; not "alarming")
+        assert_eq!(traffic_color_for(0.0), Color::White);
+        assert_eq!(traffic_color_for(79.9), Color::White);
+        // 80-94.9% → yellow heads-up
+        assert_eq!(traffic_color_for(80.0), Color::Yellow);
+        assert_eq!(traffic_color_for(94.9), Color::Yellow);
+        // 95%+ → red, tunnels may stop forwarding
+        assert_eq!(traffic_color_for(95.0), Color::Red);
+        assert_eq!(traffic_color_for(100.0), Color::Red);
+        assert_eq!(traffic_color_for(150.0), Color::Red);
     }
 }

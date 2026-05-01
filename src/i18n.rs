@@ -210,6 +210,23 @@ pub struct Strings {
     pub sf_no_selected_tunnel: &'static str,
     pub sf_token_saved: &'static str,
     pub sf_refreshing: &'static str,
+
+    // v0.12 — onboarding & error diagnostics
+    pub sf_err_unauthorized: &'static str,
+    pub sf_err_forbidden: &'static str,
+    pub sf_onboarding_step1: &'static str,
+    pub sf_onboarding_step2: &'static str,
+    pub sf_onboarding_step3: &'static str,
+    pub sf_tunnels_empty_header: &'static str,
+    pub sf_tunnels_empty_option_v013: &'static str,
+    pub sf_tunnels_empty_option_browser_a: &'static str,
+    pub sf_tunnels_empty_option_browser_b: &'static str,
+    pub sf_tunnels_empty_option_launcher: &'static str,
+    pub sf_action_open_dashboard: &'static str,
+    pub sf_mihomo_warning: &'static str,
+    pub sf_launcher_hint: &'static str,
+    pub sf_traffic_warning_high: &'static str,
+    pub sf_traffic_warning_critical: &'static str,
 }
 
 pub const EN: Strings = Strings {
@@ -344,7 +361,7 @@ pub const EN: Strings = Strings {
     title_sakurafrp_user: " User ",
     title_sakurafrp_tunnels: " Tunnels ",
     title_sakurafrp_actions: " Actions ",
-    hint_sakurafrp: "↑/↓ select   Enter copy address   t set token   r refresh   q quit",
+    hint_sakurafrp: "↑/↓ select   Enter copy address   t set token   o open natfrp.com   r refresh   q quit",
     sf_user_no_token: "(no token set — pick \"Set token\" below to enter one)",
     sf_user_loading: "(loading…)",
     sf_user_token_label: "token",
@@ -368,6 +385,21 @@ pub const EN: Strings = Strings {
     sf_no_selected_tunnel: "✗ Select a tunnel first.",
     sf_token_saved: "✓ Token saved (~/.config/mc-tui/natfrp.token, 0600).",
     sf_refreshing: "→ Fetching from api.natfrp.com…",
+    sf_err_unauthorized: "✗ Token invalid or revoked — press t to paste a fresh access key.",
+    sf_err_forbidden: "✗ Token lacks permissions — check the access key's permission switches in the SakuraFrp dashboard.",
+    sf_onboarding_step1: "① Open https://www.natfrp.com (press o)",
+    sf_onboarding_step2: "② User Center → Access Key → copy",
+    sf_onboarding_step3: "③ Press t and paste it here",
+    sf_tunnels_empty_header: "(your account has no tunnels yet.)",
+    sf_tunnels_empty_option_v013: "  • Recommended (v0.13+): press c to create one with a game-friendly node",
+    sf_tunnels_empty_option_browser_a: "  • Now: open natfrp.com → Tunnels → Add",
+    sf_tunnels_empty_option_browser_b: "        → type tcp / local 127.0.0.1:25565",
+    sf_tunnels_empty_option_launcher: "  • Or: create one in the launcher GUI",
+    sf_action_open_dashboard: "Open natfrp.com",
+    sf_mihomo_warning: "⚠ Sparkle/mihomo is running — friends may disconnect after ~30s. Run `pkill -f sparkle && docker restart natfrp-service` before they join.",
+    sf_launcher_hint: "ℹ Tunnel detected but launcher container is not running — switch to the Server tab to start it.",
+    sf_traffic_warning_high: "⚠ Traffic over 80% of plan",
+    sf_traffic_warning_critical: "⚠ Traffic over 95% of plan — tunnels may stop forwarding",
 };
 
 pub const ZH: Strings = Strings {
@@ -502,7 +534,7 @@ pub const ZH: Strings = Strings {
     title_sakurafrp_user: " 账户 ",
     title_sakurafrp_tunnels: " 隧道 ",
     title_sakurafrp_actions: " 操作 ",
-    hint_sakurafrp: "↑/↓ 选择   Enter 复制公网地址   t 设置 token   r 刷新   q 退出",
+    hint_sakurafrp: "↑/↓ 选择   Enter 复制公网地址   t 设置 token   o 打开 natfrp.com   r 刷新   q 退出",
     sf_user_no_token: "(未设置 token — 在下方选「设置 token」录入)",
     sf_user_loading: "(加载中…)",
     sf_user_token_label: "token",
@@ -526,6 +558,21 @@ pub const ZH: Strings = Strings {
     sf_no_selected_tunnel: "✗ 请先选中一个隧道。",
     sf_token_saved: "✓ token 已保存 (~/.config/mc-tui/natfrp.token, 0600)。",
     sf_refreshing: "→ 正在请求 api.natfrp.com…",
+    sf_err_unauthorized: "✗ token 无效或已过期 — 按 t 重新粘贴访问密钥。",
+    sf_err_forbidden: "✗ token 权限不足 — 在 SakuraFrp 后台检查访问密钥的「权限」开关。",
+    sf_onboarding_step1: "① 浏览器打开 https://www.natfrp.com（按 o 自动打开）",
+    sf_onboarding_step2: "② 用户中心 → 「访问密钥」 → 复制",
+    sf_onboarding_step3: "③ 回到这里按 t 粘贴",
+    sf_tunnels_empty_header: "(你的账户还没有隧道。)",
+    sf_tunnels_empty_option_v013: "  • 推荐 (v0.13+)：按 c 一键建（含游戏专用节点）",
+    sf_tunnels_empty_option_browser_a: "  • 现在：浏览器去 natfrp.com → 隧道列表 → 添加",
+    sf_tunnels_empty_option_browser_b: "        → 类型 tcp / 本地 127.0.0.1:25565",
+    sf_tunnels_empty_option_launcher: "  • 或：用 launcher GUI 建",
+    sf_action_open_dashboard: "打开 natfrp.com",
+    sf_mihomo_warning: "⚠ Sparkle/mihomo 在跑 — 朋友可能 30 秒后掉线，玩之前先跑 `pkill -f sparkle && docker restart natfrp-service`。",
+    sf_launcher_hint: "ℹ 检测到隧道但 launcher 容器未运行 — 切到「运维」tab 启动。",
+    sf_traffic_warning_high: "⚠ 流量已用超过 80%",
+    sf_traffic_warning_critical: "⚠ 流量已用超过 95% — 隧道可能停止转发",
 };
 
 // Parametric messages — return owned Strings.
@@ -710,6 +757,59 @@ pub fn fmt_log_read_error(lang: Lang, err: &str) -> String {
     match lang {
         Lang::En => format!("(read error: {})", err),
         Lang::Zh => format!("(读取失败: {})", err),
+    }
+}
+
+// v0.12 — SakuraFrp API error translations that need a code or detail string.
+//
+// The API has been historically misclassified to the user as raw GET path errors
+// ("✗ user_info: GET /user/info"). These helpers map a typed `NatfrpError` shape
+// into actionable copy. The `Network` flavor in particular hints at the user's
+// own mihomo workflow, since that's the most common cause we've seen.
+
+pub fn fmt_sf_err_server(lang: Lang, code: u16) -> String {
+    match lang {
+        Lang::En => format!(
+            "✗ api.natfrp.com server error (HTTP {}). Wait a few minutes and press r.",
+            code
+        ),
+        Lang::Zh => format!(
+            "✗ api.natfrp.com 服务端错误 (HTTP {})。稍等几分钟再按 r 刷新。",
+            code
+        ),
+    }
+}
+
+pub fn fmt_sf_err_http(lang: Lang, code: u16) -> String {
+    match lang {
+        Lang::En => format!("✗ api.natfrp.com returned HTTP {}.", code),
+        Lang::Zh => format!("✗ api.natfrp.com 返回 HTTP {}。", code),
+    }
+}
+
+pub fn fmt_sf_err_network(lang: Lang, detail: &str) -> String {
+    match lang {
+        Lang::En => format!(
+            "✗ Cannot reach api.natfrp.com ({}). If Sparkle/mihomo is running, try `pkill -f sparkle`.",
+            detail
+        ),
+        Lang::Zh => format!(
+            "✗ 连不上 api.natfrp.com ({})。若 Sparkle/mihomo 在跑，试试 `pkill -f sparkle`。",
+            detail
+        ),
+    }
+}
+
+pub fn fmt_sf_err_parse(lang: Lang, detail: &str) -> String {
+    match lang {
+        Lang::En => format!(
+            "✗ api.natfrp.com response unexpected ({}). Schema may have changed; report this.",
+            detail
+        ),
+        Lang::Zh => format!(
+            "✗ api.natfrp.com 返回的数据不符预期 ({})。可能 schema 变了，请上报。",
+            detail
+        ),
     }
 }
 
